@@ -205,7 +205,7 @@ v0.1 刻意只做一个端、单实例、MySQL。下一步按优先级：第二�
 
 ## 作者与维护
 
-GoAllAdmin 由新加坡籍华人 Danny 与 Sean 共同开发，并由 STARDATA INTERNATIONAL PTE. LTD. 与两位作者共同维护。
+GoAllAdmin 由新加坡籍华人 Danny Xu 与 Sean Xiang 共同开发，并由 STARDATA INTERNATIONAL PTE. LTD. 与两位作者共同维护。
 
 ## 许可
 
