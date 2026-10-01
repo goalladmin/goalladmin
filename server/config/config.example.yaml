@@ -1,0 +1,78 @@
+# GoAllAdmin 配置示例。复制为 config.yaml 后修改；config.yaml 不进 git（.gitignore 已排除），
+# 所以本地开发可以把数据库密码和 JWT 密钥直接写在里面。环境变量的优先级高于文件，容器部署时用环境变量：
+#   GA_DB_PASSWORD            -> database.password
+#   GA_JWT_SECRET_PLATFORM    -> portals.platform.jwtSecret（每个端一个，名字是端代号大写）
+#
+# 其余可用环境变量覆盖的键：
+#   GA_SERVER_ADDR, GA_SERVER_MODE, GA_SERVER_TRUSTED_PROXIES（逗号分隔）, GA_SERVER_ALLOWED_ORIGINS（逗号分隔）,
+#   GA_SERVER_MAX_BODY_BYTES, GA_SERVER_READ_HEADER_TIMEOUT, GA_SERVER_READ_TIMEOUT, GA_SERVER_WRITE_TIMEOUT,
+#   GA_SERVER_IDLE_TIMEOUT, GA_SERVER_SHUTDOWN_TIMEOUT, GA_SERVER_HANDLER_TIMEOUT（时长写法同下，如 30s、2m）,
+#   GA_DB_HOST, GA_DB_PORT, GA_DB_NAME, GA_DB_USER, GA_DB_PARAMS, GA_DB_MAX_OPEN_CONNS, GA_DB_MAX_IDLE_CONNS,
+#   GA_DB_CONN_MAX_LIFETIME, GA_DB_SLOW_THRESHOLD, GA_DB_CONNECT_TIMEOUT, GA_DB_READ_TIMEOUT, GA_DB_WRITE_TIMEOUT,
+#   GA_DB_CONNECT_WAIT, GA_LOG_LEVEL, GA_LOG_FORMAT, GA_MIGRATE_AUTO,
+#   GA_MONITOR_SERVER, GA_MONITOR_SERVER_CACHE, GA_MONITOR_SECURITY_CACHE
+
+server:
+  addr: 0.0.0.0:8080
+  mode: debug                 # debug | release；release 会做启动校验（规范 §11.2）
+  trustedProxies: []          # 部署在 nginx 后面时填 nginx 地址，如 ["10.0.0.5"]；空 = 不信任任何代理
+  allowedOrigins: []          # 登录、刷新、登出接口校验 Origin 的白名单；release 模式必须非空
+  maxBodyBytes: 1048576       # 请求体上限，1 MB
+  readHeaderTimeout: 10s      # 下面四个超时都要设，缺一个就给慢请求留了口子（规范 §12.1）
+  readTimeout: 30s            # 读完整个请求（含正文）
+  writeTimeout: 60s           # 读完请求头到写完响应
+  idleTimeout: 120s           # keep-alive 空闲连接
+  shutdownTimeout: 15s
+  handlerTimeout: 30s         # 单个请求的处理时限，到点取消其中的数据库查询并回 503；必须小于 writeTimeout（D-037）
+
+database:
+  host: 127.0.0.1
+  port: 3306
+  name: goalladmin
+  user: goalladmin
+  password: ""                # 本地开发可直接填；设置了 GA_DB_PASSWORD 时以环境变量为准
+  params: charset=utf8mb4&parseTime=true&loc=UTC
+  maxOpenConns: 50
+  maxIdleConns: 10
+  connMaxLifetime: 1h
+  slowThreshold: 200ms
+  # 数据库故障时的保护（D-037）。三个超时拼进连接串；params 里写了同名参数（timeout / readTimeout / writeTimeout）时以它为准
+  connectTimeout: 5s          # 建立连接的上限，1s–1m
+  readTimeout: 30s            # 单次网络读的上限：数据库假死时最多等这么久，1s–10m，不能小于 server.handlerTimeout（迁移不受它限制）
+  writeTimeout: 30s           # 单次网络写的上限，1s–10m
+  connectWait: 0s             # 启动时等数据库就绪的最长时间，每 2 秒重试；0 = 连不上立即退出，最长 10m
+
+log:
+  level: debug                # debug | info | warn | error
+  format: text                # text | json
+
+migrate:
+  auto: true                  # 启动时自动执行迁移；生产建议关掉，改用 `server migrate up`
+
+monitor:                      # 监控中心（D-030、D-031）
+  server: true                # false：关闭"服务器状态"（不采集请求统计，页面只显示安全态势）  GA_MONITOR_SERVER
+  serverCache: 2s             # 服务器状态在进程内的缓存时长，0–1m，0 表示不缓存  GA_MONITOR_SERVER_CACHE
+  securityCache: 10s          # 安全统计的缓存时长，0–1m  GA_MONITOR_SECURITY_CACHE
+
+portals:
+  platform:
+    accessTTL: 15m
+    refreshTTL: 168h
+    jwtSecret: ""             # 至少 32 字节（openssl rand -base64 48）；设置了 GA_JWT_SECRET_PLATFORM 时以环境变量为准
+    # 登录防护（规范 §5.7）。不写或写 0 = 用默认值；没有关闭开关，超出括号里的范围拒绝启动（D-024）。
+    login:
+      captchaAlways: false      # true = 每次登录都要验证码
+      captchaAfterFailures: 3   # 同账号+IP 失败几次后要验证码（1–5）
+      lockAfterFailures: 10     # 同账号+IP 失败几次后锁定（1–20）
+      accountLockAfter: 50      # 同账号所有 IP 累计失败几次后锁定账号（1–200）
+      lockDuration: 15m         # 锁定时长（1m–24h）
+      window: 15m               # 统计失败次数的窗口（1m–24h）
+      ipRatePerMinute: 20       # 同 IP 每分钟登录请求数（1–600）
+      accountRatePerMinute: 10  # 同账号每分钟登录请求数（1–120）
+    # 密码策略（规范 §5.6）。"字母加数字、不等于账号、不与上一次相同"始终生效，这里只能往上加。
+    password:
+      minLength: 10             # 最短长度（8–64）
+      requireUpper: false       # 必须含大写字母
+      requireLower: false       # 必须含小写字母
+      requireSymbol: false      # 必须含符号
+      maxAgeDays: 0             # 密码有效期（天），0 = 不过期（1–3650）；过期后登录照常，但必须先改密

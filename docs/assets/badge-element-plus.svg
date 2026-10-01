@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="141" height="24" role="img" aria-label="Element Plus: 2.14">
+  <title>Element Plus: 2.14</title>
+  <clipPath id="badge"><rect width="141" height="24" rx="4"/></clipPath>
+  <g clip-path="url(#badge)">
+    <path fill="#334155" d="M0 0h97v24H0z"/>
+    <path fill="#2563eb" d="M97 0h44v24H97z"/>
+  </g>
+  <g fill="#fff" text-anchor="middle" font-family="Verdana,DejaVu Sans,sans-serif" font-size="11">
+    <text x="48" y="16">Element Plus</text>
+    <text x="119" y="16">2.14</text>
+  </g>
+</svg>

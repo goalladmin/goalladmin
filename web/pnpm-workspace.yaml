@@ -1,0 +1,9 @@
+packages:
+  - packages/*
+  - apps/*
+
+# 工作区内的包按版本号互相引用（apps/platform 依赖 "@ga/shell": "0.1.0"），pnpm 和 npm 都会链接到本地目录。
+linkWorkspacePackages: true
+
+# 供应链：不安装发布不足 7 天的版本（单位：分钟）。规范 §2。npm 没有对应设置，用 npm 时以锁定的精确版本为准。
+minimumReleaseAge: 10080

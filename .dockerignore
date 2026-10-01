@@ -1,0 +1,44 @@
+# Docker 构建上下文是仓库根目录（docker compose 的 context: ..）。这里列出的内容不会发给 Docker daemon。
+# 就算 Dockerfile 只 COPY 了部分目录，上下文里的每个文件都会被打包上传，并可能留在构建缓存、远程 builder
+# 或 CI 缓存里，所以配置文件和密钥必须在这一层就排除，而不是指望 Dockerfile 不去 COPY 它们。
+
+# 本地配置与密钥（规范 §11.1：机密只走环境变量或不进 git 的本地文件）
+server/config
+**/*.local.yaml
+**/.env
+**/.env.*
+
+# 版本库、私有目录、临时目录
+.git
+.github
+.local
+_to_delete
+
+# 文档、脚本、Makefile：镜像里用不到
+docs
+scripts
+Makefile
+*.md
+CLAUDE.md
+# 例外：镜像里要带本项目的 LICENSE、NOTICE 和生成第三方许可证清单的脚本（D-028）
+!LICENSE
+!NOTICE
+!scripts/go-licenses.sh
+
+# 构建产物、依赖缓存、测试输出
+server/bin
+server/tmp
+server/server
+server/coverage.out
+web/node_modules
+web/**/node_modules
+web/**/dist
+web/**/coverage
+web/**/playwright-report
+web/**/test-results
+
+# 编辑器 / 系统文件
+.DS_Store
+.idea
+.vscode
+**/*.swp

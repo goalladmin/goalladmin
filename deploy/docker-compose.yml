@@ -1,0 +1,79 @@
+# 本地一键启动：MySQL + 后端 + 前端（nginx 托管产物并反代 /api）。
+#
+#   cp deploy/.env.example deploy/.env   # 填好密码和 JWT 密钥
+#   docker compose -f deploy/docker-compose.yml up -d
+#   docker compose -f deploy/docker-compose.yml exec server /server admin create -username admin
+#   open http://localhost:8000
+#
+# 后端的 8080 只给容器网络用；浏览器一律经 nginx 访问，这样刷新 Cookie 与页面同源（规范 §5.2）。
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${GA_DB_ROOT_PASSWORD:?set GA_DB_ROOT_PASSWORD in deploy/.env}
+      MYSQL_DATABASE: goalladmin
+      MYSQL_USER: goalladmin
+      MYSQL_PASSWORD: ${GA_DB_PASSWORD:?set GA_DB_PASSWORD in deploy/.env}
+      TZ: UTC
+    command: --default-time-zone=+00:00 --character-set-server=utf8mb4 --collation-server=utf8mb4_0900_ai_ci
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${GA_DB_ROOT_PASSWORD}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    # 数据库端口不对外映射（规范 §12）。需要本机连库时临时加 ports。
+
+  server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.server
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      GA_SERVER_ADDR: 0.0.0.0:8080
+      GA_SERVER_MODE: ${GA_SERVER_MODE:-release}
+      # 前端的访问地址：改了 GA_WEB_PORT 或用域名访问时要一起改，否则刷新凭证和登出会被当成跨站请求拒绝
+      GA_SERVER_ALLOWED_ORIGINS: ${GA_SERVER_ALLOWED_ORIGINS:-http://localhost:8000}
+      # 只信任 nginx 容器（下面给它固定了 IP）。信任整段私网会让内网客户端伪造 X-Forwarded-For 绕过按 IP 的登录限流。
+      GA_SERVER_TRUSTED_PROXIES: ${GA_SERVER_TRUSTED_PROXIES:-172.30.0.10}
+      GA_DB_HOST: mysql
+      GA_DB_PORT: "3306"
+      GA_DB_NAME: goalladmin
+      GA_DB_USER: goalladmin
+      GA_DB_PASSWORD: ${GA_DB_PASSWORD}
+      GA_DB_CONNECT_WAIT: 60s   # 数据库重启时服务也被拉起，先等它一会儿再放弃（D-037）
+      GA_JWT_SECRET_PLATFORM: ${GA_JWT_SECRET_PLATFORM:?set GA_JWT_SECRET_PLATFORM in deploy/.env}
+      GA_MIGRATE_AUTO: "true"
+      GA_LOG_FORMAT: json
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "/server", "healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.web
+    depends_on:
+      server:
+        condition: service_healthy
+    ports:
+      - "${GA_WEB_PORT:-8000}:80"
+    networks:
+      default:
+        ipv4_address: 172.30.0.10
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  mysql-data:

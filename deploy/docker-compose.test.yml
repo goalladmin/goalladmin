@@ -1,0 +1,23 @@
+# 本地开发与测试用 MySQL。`make test-db-up` 启动，`make test-db-down` 销毁（数据在 tmpfs 里，不持久）。
+# 与 Makefile 里 GA_TEST_DSN 和 `make run` 的默认值一致；mysql-init/ 里的脚本给测试用户建库权限并创建开发库 goalladmin。
+services:
+  mysql-test:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: root_test_pw
+      MYSQL_DATABASE: goalladmin_test
+      MYSQL_USER: ga
+      MYSQL_PASSWORD: ga_test_pw
+      TZ: UTC
+    command: --default-time-zone=+00:00 --character-set-server=utf8mb4 --collation-server=utf8mb4_0900_ai_ci
+    ports:
+      - "127.0.0.1:3307:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot_test_pw"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - ./mysql-init:/docker-entrypoint-initdb.d:ro
+    tmpfs:
+      - /var/lib/mysql

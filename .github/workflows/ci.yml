@@ -1,0 +1,59 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root_test_pw
+          MYSQL_DATABASE: goalladmin_test
+          MYSQL_USER: ga
+          MYSQL_PASSWORD: ga_test_pw
+          TZ: UTC
+        ports:
+          - 3307:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot_test_pw"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      # 测试需要建临时库，所以 CI 里用 root
+      GA_TEST_DSN: root:root_test_pw@tcp(127.0.0.1:3307)/goalladmin_test?charset=utf8mb4&parseTime=true&loc=UTC&multiStatements=true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable   # 最新的稳定版；go.mod 的 go 指令只是最低要求
+          cache-dependency-path: server/go.sum
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: web/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: install golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          # 必须能读上面那个 Go 版本产出的导出数据：Go 出新的大版本后要同步升 golangci-lint
+          # （v2.13 起支持 Go 1.27），否则报 "export data version N is greater than maximum supported"。
+          version: v2.13.2
+          working-directory: server
+          args: --help
+      - name: ci
+        run: make ci
+      - name: govulncheck
+        run: make vuln
+      - name: playwright browsers
+        run: cd web/apps/platform && npx playwright install --with-deps chromium
+      - name: e2e
+        run: make e2e

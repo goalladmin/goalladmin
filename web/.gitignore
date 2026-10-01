@@ -1,0 +1,9 @@
+node_modules/
+# 可复现安装以 pnpm-lock.yaml 为准；npm 生成的锁文件不提交，避免两份锁文件漂移
+package-lock.json
+dist/
+coverage/
+playwright-report/
+test-results/
+.vite/
+*.local

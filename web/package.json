@@ -1,0 +1,21 @@
+{
+  "name": "goalladmin-web",
+  "private": true,
+  "description": "GoAllAdmin 前端工作区：packages/shell 是框架壳，apps/<portal> 是各端应用",
+  "packageManager": "pnpm@10.28.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "lint": "npm run lint --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "build": "npm run build --workspaces --if-present",
+    "dev": "npm run dev -w @ga/platform",
+    "e2e": "npm run e2e -w @ga/platform"
+  }
+}

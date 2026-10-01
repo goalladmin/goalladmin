@@ -1,0 +1,35 @@
+# build
+/server/bin/
+/server/tmp/
+/web/**/dist/
+/web/**/node_modules/
+/.pnpm-store/
+
+# local config and secrets
+/server/config/config.yaml
+/server/config/*.local.yaml
+.env
+.env.*
+!.env.example
+
+# test / coverage
+/server/coverage.out
+/web/**/coverage/
+/web/**/playwright-report/
+/web/**/test-results/
+
+# editors / os
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# private planning docs, word lists, scratch — never committed
+/.local/
+/_to_delete/
+
+# stray build output
+/server/server
+
+# 桌面应用把聊天里发出的文件存到这里，不是仓库内容
+/Claude outputs/

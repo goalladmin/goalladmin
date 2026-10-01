@@ -1,0 +1,31 @@
+# 构建上下文是仓库根目录：docker build -f deploy/Dockerfile.server .
+# 根目录 .dockerignore 已把 server/config、.env、.git 等排除在上下文之外；这里再只 COPY 二进制需要的目录，
+# 双重保证本地配置和密钥不会进入镜像层或构建缓存。
+#
+# 用仍在安全维护期内的 Go 构建（官方只维护最近两个大版本）。固定到具体补丁版本是为了让每次构建的
+# 标准库版本可确认、可复现（标准库的安全修复都按补丁版本发布）；出新补丁时手动改这一行并重新构建。
+# go.mod 里的 go 指令是最低语言版本，不需要跟着升。
+FROM golang:1.27.1-alpine AS build
+WORKDIR /src
+COPY server/go.mod server/go.sum ./
+RUN go mod download
+COPY server/main.go ./
+COPY server/core core/
+COPY server/modules modules/
+COPY server/migrations migrations/
+RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/server .
+# 编译进二进制的第三方模块和 Go 标准库的许可证原文（D-028）；某个模块没有许可证文件时构建失败
+COPY scripts/go-licenses.sh /tmp/go-licenses.sh
+RUN CGO_ENABLED=0 sh /tmp/go-licenses.sh /src /out/third-party-licenses.txt
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/server /server
+COPY --from=build /out/third-party-licenses.txt /licenses/third-party-licenses.txt
+COPY LICENSE NOTICE /licenses/
+# 镜像默认 release 模式（D-058）：直接 docker run 也会校验密钥、Origin 白名单、给刷新 Cookie 加 Secure；
+# 要在本机调试时显式传 -e GA_SERVER_MODE=debug
+ENV GA_SERVER_MODE=release
+EXPOSE 8080
+USER nonroot
+ENTRYPOINT ["/server"]
+CMD ["serve"]

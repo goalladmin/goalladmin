@@ -1,0 +1,43 @@
+{
+  "name": "@ga/shell",
+  "version": "0.1.0",
+  "private": true,
+  "description": "GoAllAdmin 前端壳：请求、认证、权限、路由、布局、内置页面、国际化。业务方不改。",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./styles": "./src/styles/index.css"
+  },
+  "scripts": {
+    "lint": "eslint .",
+    "typecheck": "vue-tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "build": "echo '@ga/shell 以源码形式被各端引用，不单独构建'"
+  },
+  "dependencies": {
+    "@element-plus/icons-vue": "2.3.2",
+    "axios": "1.20.0",
+    "element-plus": "2.14.6",
+    "flag-icons": "7.5.0",
+    "pinia": "3.0.4",
+    "vue": "3.5.43",
+    "vue-i18n": "11.4.12",
+    "vue-router": "4.6.4"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "22.20.4",
+    "@vitejs/plugin-vue": "6.0.9",
+    "@vue/test-utils": "2.5.1",
+    "eslint": "10.11.0",
+    "eslint-plugin-vue": "10.11.0",
+    "globals": "17.12.0",
+    "jsdom": "30.1.0",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.70.0",
+    "vite": "8.3.0",
+    "vitest": "5.0.1",
+    "vue-eslint-parser": "10.4.1",
+    "vue-tsc": "3.3.11"
+  }
+}

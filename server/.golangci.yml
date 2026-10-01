@@ -1,0 +1,41 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - misspell
+    - gosec
+    - bodyclose
+    - errorlint
+    - noctx
+    - unconvert
+    - unparam
+    - prealloc
+  settings:
+    gosec:
+      excludes:
+        - G104 # handled by errcheck
+    errcheck:
+      exclude-functions:
+        - (*github.com/gin-gonic/gin.Context).Error
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+          - noctx
+          - unparam
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
