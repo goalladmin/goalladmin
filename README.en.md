@@ -207,7 +207,7 @@ Contributed code must be your own work; where third-party code is genuinely need
 
 ## Authors and maintenance
 
-GoAllAdmin is developed by Danny, a Singaporean Chinese developer, and Sean, and is maintained by STARDATA INTERNATIONAL PTE. LTD. together with its two authors.
+GoAllAdmin is developed by Danny Xu, a Singaporean Chinese developer, and Sean Xiang, and is maintained by STARDATA INTERNATIONAL PTE. LTD. together with its two authors.
 
 ## License
 
