@@ -1,12 +1,13 @@
 # 前端镜像：构建平台端产物，交给 nginx 托管并反代 /api 到 server 服务。
+# 先只按锁文件下载依赖（pnpm fetch，这一层能缓存，和 apps/ 下有哪几个端无关：删掉不用的端也不用改这里），
+# 再拷源码、离线安装、只构建平台端（D-064）。
 FROM node:22-alpine AS build
 WORKDIR /src
 RUN corepack enable
 COPY web/pnpm-workspace.yaml web/pnpm-lock.yaml web/package.json web/.npmrc ./
-COPY web/packages/shell/package.json packages/shell/
-COPY web/apps/platform/package.json apps/platform/
-RUN pnpm install --frozen-lockfile
+RUN pnpm fetch
 COPY web/ .
+RUN pnpm install --offline --frozen-lockfile
 RUN pnpm --filter @ga/platform build
 
 FROM nginx:1.30-alpine

@@ -1,12 +1,16 @@
 <script setup lang="ts">
 // 调查时间线（D-032）：按用户、IP 或会话，把登录、操作、安全事件串成一条线。
 // 地址栏带 userId / ip / sessionId 时直接查询；每一条上的 IP、会话、账号都能点，换成按它查。
+// 先选端（D-066）：平台端（默认）、代理商端、商户端；用户 ID 只在一个端里有意义，地址栏的 portal 跟着查询条件走。
 import { onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { formatTime, useI18n } from '@ga/shell'
 
+import PortalSelect from '../../../components/PortalSelect.vue'
 import { logApi, userApi } from '../../../api/system'
 import type { TimelineItem } from '../../../api/system'
+import { opsPortals } from '../../../api/partner'
+import type { OpsPortal } from '../../../api/partner'
 
 type Subject = 'userId' | 'ip' | 'sessionId'
 
@@ -14,13 +18,13 @@ const { t, te } = useI18n()
 const route = useRoute()
 const router = useRouter()
 
-const form = reactive<{ subject: Subject; value: string }>({ subject: 'ip', value: '' })
+const form = reactive<{ portal: OpsPortal; subject: Subject; value: string }>({ portal: 'platform', subject: 'ip', value: '' })
 const users = ref<{ id: number; displayName: string }[]>([])
 const items = ref<TimelineItem[]>([])
 const more = ref(false)
 const next = ref('')
 const loading = ref(false)
-const searched = ref<{ subject: Subject; value: string } | null>(null)
+const searched = ref<{ portal: OpsPortal; subject: Subject; value: string } | null>(null)
 
 // 查询序号：先查 A、马上改查 B 时，A 的慢响应（包括"查看更多"）不能盖住或拼进 B 的结果（D-046）。
 // 换查询对象时先清空列表和游标，旧对象的"查看更多"也就无从拼接
@@ -28,7 +32,7 @@ let seq = 0
 async function load(append: boolean) {
   if (!searched.value) return
   const my = ++seq
-  const { subject, value } = searched.value
+  const { portal, subject, value } = searched.value
   if (!append) {
     items.value = []
     more.value = false
@@ -37,7 +41,7 @@ async function load(append: boolean) {
   loading.value = true
   try {
     const cursor = append ? next.value : undefined
-    const res = await logApi.timeline({ [subject]: subject === 'userId' ? Number(value) : value, cursor, limit: 100 })
+    const res = await logApi.timeline({ portal, [subject]: subject === 'userId' ? Number(value) : value, cursor, limit: 100 })
     if (my !== seq) return
     items.value = append ? items.value.concat(res.items) : res.items
     more.value = res.more
@@ -47,26 +51,37 @@ async function load(append: boolean) {
   }
 }
 
+/** 地址栏里的端：平台端不写。 */
+const portalQuery = (p: OpsPortal) => (p === 'platform' ? {} : { portal: p })
+
 function search() {
   const value = form.value.trim()
   if (!value) return
   // 查询条件写进地址栏：刷新、分享链接都还是这条线
-  void router.replace({ path: route.path, query: { [form.subject]: value } })
+  void router.replace({ path: route.path, query: { ...portalQuery(form.portal), [form.subject]: value } })
 }
 
-/** 换成按某个 IP、会话、用户查。 */
+/** 换成按某个 IP、会话、用户查（同一个端）。 */
 function pivot(subject: Subject, value: string | number) {
   if (!value) return
-  void router.push({ path: route.path, query: { [subject]: String(value) } })
+  void router.push({ path: route.path, query: { ...portalQuery(searched.value?.portal ?? form.portal), [subject]: String(value) } })
+}
+
+/** 换端：用户 ID 换了端就没有意义，按用户查时清空。 */
+function onPortal() {
+  if (form.subject === 'userId') form.value = ''
 }
 
 function fromRoute() {
+  const p = route.query.portal
+  const portal: OpsPortal = typeof p === 'string' && (opsPortals as readonly string[]).includes(p) ? (p as OpsPortal) : 'platform'
   for (const k of ['userId', 'ip', 'sessionId'] as Subject[]) {
     const v = route.query[k]
     if (typeof v === 'string' && v) {
+      form.portal = portal
       form.subject = k
       form.value = v
-      searched.value = { subject: k, value: v }
+      searched.value = { portal, subject: k, value: v }
       void load(false)
       return
     }
@@ -74,6 +89,7 @@ function fromRoute() {
   // 地址栏里没有查询条件（例如从菜单回到这页）：回到未查询的状态，在途的旧查询作废（D-047）
   seq++
   searched.value = null
+  form.portal = portal
   form.value = ''
   items.value = []
   more.value = false
@@ -129,6 +145,9 @@ const shortSid = (sid: string) => (sid ? sid.slice(0, 8) : '')
     <el-alert :title="t('ops.timeline.hint')" type="info" :closable="false" show-icon />
     <el-card>
       <el-form class="ga-toolbar" :inline="true" @submit.prevent="search">
+        <el-form-item :label="t('ops.portal.label')">
+          <PortalSelect v-model="form.portal" @update:model-value="onPortal" />
+        </el-form-item>
         <el-form-item>
           <el-radio-group v-model="form.subject" data-test="timeline-subject" @change="form.value = ''">
             <el-radio-button value="ip">IP</el-radio-button>
@@ -137,10 +156,11 @@ const shortSid = (sid: string) => (sid ? sid.slice(0, 8) : '')
           </el-radio-group>
         </el-form-item>
         <el-form-item>
-          <el-select v-if="form.subject === 'userId'" v-model="form.value" filterable :placeholder="t('ops.timeline.pickUser')" style="width: 240px">
+          <!-- 平台端从用户列表里选；代理商端、商户端填账号 ID（在代理商、商户的详情里能看到） -->
+          <el-select v-if="form.subject === 'userId' && form.portal === 'platform'" v-model="form.value" filterable :placeholder="t('ops.timeline.pickUser')" style="width: 240px">
             <el-option v-for="u in users" :key="u.id" :value="String(u.id)" :label="`${u.displayName} (#${u.id})`" />
           </el-select>
-          <el-input v-else v-model="form.value" clearable :placeholder="form.subject === 'ip' ? '203.0.113.10' : t('ops.timeline.sessionPlaceholder')" style="width: 300px" data-test="timeline-value" />
+          <el-input v-else v-model="form.value" clearable :placeholder="form.subject === 'ip' ? '203.0.113.10' : form.subject === 'userId' ? t('ops.timeline.userIdPlaceholder') : t('ops.timeline.sessionPlaceholder')" style="width: 300px" data-test="timeline-value" />
         </el-form-item>
         <el-form-item>
           <el-button type="primary" native-type="submit" data-test="timeline-search">{{ t('common.search') }}</el-button>

@@ -5,10 +5,14 @@ package logx
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"strings"
+
+	mysqldrv "github.com/go-sql-driver/mysql"
 )
 
 type ctxKey struct{}
@@ -73,10 +77,26 @@ func Audit(ctx context.Context, msg string, args ...any) {
 }
 
 func auditLevelName(_ []string, a slog.Attr) slog.Attr {
+	if err, ok := a.Value.Any().(error); ok {
+		a.Value = slog.StringValue(ErrorText(err))
+	}
 	if a.Key == slog.LevelKey {
 		if l, ok := a.Value.Any().(slog.Level); ok && l == LevelAudit {
 			a.Value = slog.StringValue("AUDIT")
 		}
 	}
 	return a
+}
+
+// ErrorText 对数据库错误仅保留编号，其他错误保留原诊断文本（D-092）。
+// 使用错误链识别驱动错误，不改变调用方持有的错误值。
+func ErrorText(err error) string {
+	if err == nil {
+		return ""
+	}
+	var me *mysqldrv.MySQLError
+	if errors.As(err, &me) {
+		return fmt.Sprintf("mysql error %d", me.Number)
+	}
+	return err.Error()
 }

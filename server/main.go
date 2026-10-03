@@ -9,6 +9,10 @@
 //	server admin create -username NAME [-config path] 创建超级管理员（随机密码只打印一次）
 //	server admin reset-password -username NAME [-config path] 重置任意账号的密码（超管的密码只能这样重置）
 //	server rbac prune   [-config path]   清理策略表里未注册的权限码
+//	server ip list      [-config path]   列出 IP 黑名单和白名单（D-062）
+//	server ip remove -id N               删除一条 IP 规则
+//	server ip clear-allow -portal P [-org N] [-user N] 清空一份 IP 白名单（把自己锁在外面时用）
+//	server ip clear-deny -portal P -org N 清空一个主体自己设的 IP 黑名单（D-102）
 //	server healthcheck  [-addr host:port] 容器健康检查
 //
 // 配置路径优先级：-config 参数 > GA_CONFIG 环境变量 > config/config.yaml（存在时）> 仅默认值和环境变量。
@@ -29,6 +33,10 @@ import (
 	"github.com/goalladmin/goalladmin/server/core/audit"
 	"github.com/goalladmin/goalladmin/server/core/conf"
 	"github.com/goalladmin/goalladmin/server/core/db"
+	"github.com/goalladmin/goalladmin/server/core/ipacl"
+	"github.com/goalladmin/goalladmin/server/modules/agent"
+	"github.com/goalladmin/goalladmin/server/modules/merchant"
+	"github.com/goalladmin/goalladmin/server/modules/onboarding"
 	"github.com/goalladmin/goalladmin/server/modules/system"
 	// 二次开发的模块（server/modules/<名>/）在这里 import，并加进下面 modules() 的列表。
 )
@@ -50,6 +58,8 @@ func main() {
 		err = cmdAdmin(os.Args[2:])
 	case "rbac":
 		err = cmdRBAC(os.Args[2:])
+	case "ip":
+		err = cmdIP(os.Args[2:])
 	case "healthcheck":
 		err = cmdHealthcheck(os.Args[2:])
 	case "help", "-h", "--help":
@@ -75,6 +85,11 @@ func usage() {
   server admin reset-password -username NAME
                                             重置账号密码（超管的密码只能这样重置），新密码只打印一次
   server rbac prune     [-config path]      清理策略表里未注册的权限码
+  server ip list        [-config path]      列出 IP 黑名单和白名单
+  server ip remove      -id N               删除一条 IP 规则（黑名单或白名单）
+  server ip clear-allow -portal P [-org N] [-user N]
+                                            清空一份 IP 白名单（不再限制）；配错白名单把自己锁在外面时用
+  server ip clear-deny  -portal P -org N    清空一个代理商或商户自己设的 IP 黑名单
   server healthcheck    [-addr host:port]   容器健康检查`)
 }
 
@@ -104,10 +119,13 @@ func build(configPath string) (*app.App, error) {
 }
 
 // modules 返回要注册的模块，顺序即初始化顺序：system 必须在前（它注册 platform 端，其他模块把路由挂在这个端下），
-// 然后是二次开发的模块（server/modules/<名>/）。
+// 然后是框架自带的代理商管理、商户管理（用不到代理商端、商户端的项目删掉这两行即可），再是二次开发的模块（server/modules/<名>/）。
 func modules() []app.Module {
 	return []app.Module{
 		system.Module(),
+		agent.Module(),    // 代理商管理（D-065）
+		merchant.Module(), // 商户管理（D-065）
+		onboarding.Module("platform"),
 	}
 }
 
@@ -285,6 +303,96 @@ func cmdRBAC(args []string) error {
 	}
 	fmt.Printf("已删除 %d 条未注册权限码的策略\n", n)
 	return nil
+}
+
+// cmdIP 是 IP 名单的命令行兜底（D-062）：后台配错白名单把自己锁在外面时，在服务器上清掉。
+// 改动对三个程序都生效（别的程序最长 5 秒跟上），记 cli 安全事件。
+func cmdIP(args []string) error {
+	if len(args) < 1 {
+		return errors.New("ip 需要子命令: list | remove | clear-allow | clear-deny")
+	}
+	sub := args[0]
+	fs := flag.NewFlagSet("ip "+sub, flag.ExitOnError)
+	cfgPath := configFlag(fs)
+	id := fs.Uint64("id", 0, "规则 ID（remove）")
+	portalCode := fs.String("portal", "", "端代号（clear-allow、clear-deny）")
+	orgID := fs.Uint64("org", 0, "主体 ID（clear-allow 可选，clear-deny 必填）")
+	userID := fs.Uint64("user", 0, "用户 ID（clear-allow，可选）")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	a, err := build(*cfgPath)
+	if err != nil {
+		return err
+	}
+	ctx := a.Context(context.Background())
+	defer func() { _ = a.Stop(ctx) }()
+	acl := a.Deps().IPACL
+	if acl == nil {
+		return errors.New("没有数据库连接")
+	}
+	record := func(detail string) error {
+		return a.Deps().Audit.RecordSecurity(ctx, audit.NewSecurityEvent{Kind: system.KindCLI, Detail: detail})
+	}
+	switch sub {
+	case "list":
+		rules, err := acl.All(ctx)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%-8s %-6s %-7s %-10s %-8s %-8s %-40s %-25s %s\n", "ID", "KIND", "SCOPE", "PORTAL", "ORG", "USER", "CIDR", "EXPIRES", "REMARK")
+		for _, r := range rules {
+			exp := "-"
+			if r.ExpiresAt != nil {
+				exp = r.ExpiresAt.UTC().Format(time.RFC3339)
+			}
+			fmt.Printf("%-8d %-6s %-7s %-10s %-8d %-8d %-40s %-25s %s\n", r.ID, r.Kind, r.Scope, r.Portal, r.OrgID, r.UserID, r.CIDR, exp, r.Remark)
+		}
+		return nil
+	case "remove":
+		if *id == 0 {
+			return errors.New("ip remove 需要 -id")
+		}
+		r, err := acl.Remove(ctx, *id)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("已删除 %s %s %s\n", r.Kind, r.Scope, r.CIDR)
+		return record(fmt.Sprintf("ip remove: %d %s %s %s", r.ID, r.Kind, r.Scope, r.CIDR))
+	case "clear-allow":
+		if *portalCode == "" {
+			return errors.New("ip clear-allow 需要 -portal")
+		}
+		t := ipacl.PortalTarget(*portalCode)
+		switch {
+		case *userID != 0:
+			t = ipacl.UserTarget(*portalCode, *orgID, *userID)
+		case *orgID != 0:
+			t = ipacl.OrgTarget(*portalCode, *orgID)
+		}
+		n, err := acl.ClearAllow(ctx, t)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("已清空白名单（%s %s 主体 %d 用户 %d），删除 %d 条\n", t.Scope, t.Portal, t.OrgID, t.UserID, n)
+		return record(fmt.Sprintf("ip clear-allow: %s %s org=%d user=%d (%d)", t.Scope, t.Portal, t.OrgID, t.UserID, n))
+	case "clear-deny":
+		if *portalCode == "" || *orgID == 0 {
+			return errors.New("ip clear-deny 需要 -portal 和 -org")
+		}
+		if *userID != 0 {
+			return errors.New("ip clear-deny 不接受 -user：黑名单只有全局的和主体的")
+		}
+		t := ipacl.OrgTarget(*portalCode, *orgID)
+		n, err := acl.ClearOrgDeny(ctx, t)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("已清空主体黑名单（%s 主体 %d），删除 %d 条\n", t.Portal, t.OrgID, n)
+		return record(fmt.Sprintf("ip clear-deny: %s org=%d (%d)", t.Portal, t.OrgID, n))
+	default:
+		return fmt.Errorf("未知的 ip 子命令 %q（可用: list | remove | clear-allow | clear-deny）", sub)
+	}
 }
 
 func cmdHealthcheck(args []string) error {

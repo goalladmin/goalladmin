@@ -142,7 +142,7 @@ func (s *OrderService) Create(ctx context.Context, in OrderInput) (*Order, error
 
 ### 6. handler
 
-只做三件事：绑定参数、调 service、输出信封。分页参数用 `httpx.BindPage(c)`，请求体用 `httpx.BindJSON(c, &req)`（`binding` tag 做格式校验），成功 `httpx.OK` / `httpx.OKPage`，失败 `httpx.Fail`。看 `server/modules/system/handlers_org.go`。
+只做三件事：绑定参数、调 service、输出信封。分页参数用 `httpx.BindPage(c)`，请求体用 `httpx.BindJSON(c, &req)`（`binding` tag 做格式校验；只收 `Content-Type: application/json` 的请求体，别的类型回 `3002`，D-095），成功 `httpx.OK` / `httpx.OKPage`，失败 `httpx.Fail`。看 `server/modules/system/handlers_org.go`。
 
 ### 7. 权限码、菜单、动作名（`perms.go`）
 
@@ -243,6 +243,61 @@ func modules() []app.Module {
 `route_actor_test.go` 和 `stale_actor_test.go` 里的 `inFlight`。
 
 `make ci` 会跑依赖方向检查：模块之间不能互相 import，不能碰 `core/internal`。
+
+## 主体端模块的区别
+
+上面的例子默认注册到平台。写代理商或商户模块时，保留同一套 handler → service → repo 结构，并增加以下约束（规范 §7.1、D-061 至 D-067、D-073）。
+
+### 入口、迁移与页面
+
+商户模块注册到 `server/cmd/merchant/main.go` 的 `modules()`，放在 `merchantportal.Module()` 后面；代理商模块对应 `cmd/agent` 和 `agentportal.Module()`。使用已经注册的端，不在业务模块里重新注册端，也不把另一个端的后台模块 import 进来。权限码和菜单的 `Portal` 固定为本端。
+
+页面放进 `web/apps/merchant/src/views` 或 `web/apps/agent/src/views`，接口使用本端 `useRequest()`，不传主体 ID，不引用另一个应用的源码。主体编号只用于登录，登录后的归属来自会话。
+
+新业务表仍只由平台程序迁移。若业务模块只在主体端提供路由，可以在该业务包中自行提供一个 `SchemaModule()` 工厂：返回只提供 `Migrations()`、其他生命周期方法为空的模块，在平台 `modules()` 注册；主体端注册正常模块，使用相同嵌入文件和版本表核对迁移。这里的 `SchemaModule` 是业务方需要实现的工厂，不是框架现成 API。不要让平台注册主体端路由，也不要复制两份迁移文件或跳过主体端的迁移核对。
+
+### 每次查询都限制归属
+
+主体拥有的数据带明确归属列，例如 `merchant_id`。按业务需要给它建索引，主体内唯一的业务编号使用 `(merchant_id, order_no)` 联合唯一索引。创建时从重新认定的操作人 `actor.OrgID` 写入，不接受请求体或查询参数中的 `orgId`、`merchantId` 作为当前归属。
+
+列表、详情、统计、导出、关联查询以及按 ID 更新/删除都必须加 scope；仅在列表加条件不够。repo 示例：
+
+```go
+func (r *OrderRepo) Get(ctx context.Context, id uint64) (*Order, error) {
+	var row Order
+	err := db.From(ctx).Scopes(scope.ByOrg(ctx, "merchant_id")).Where("id = ?", id).First(&row).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, httpx.ErrNotFound
+	}
+	return &row, err
+}
+```
+
+更新/删除同样在 SQL 上应用 `scope.ByOrg`，不要先做一次无条件查询再在 handler 里判断。其他主体的数据统一作为不存在处理。身份缺失或没有主体时 scope 报错；不能捕获这个错误后改成无条件查询。平台全量查看使用独立的 repo 方法和平台权限，不复用主体端方法绕过 scope。
+
+主键也通过占位符绑定；不要把请求字符串传给 `First(&row, value)` 等内联条件接口，字符串可能被当作 SQL 条件。当前程序各注册自己的端；扩展到一个程序提供多个主体端时，仓库还须核对 `Principal.Portal` 与本仓库所属端相同，不能只比较可能重号的主体 ID。
+
+代理商查看名下商户的数据时，对业务表的商户归属列使用 `org.ByChildOrgs(ctx, "merchant_id")`。它只接受代理商身份，按当前代理商名下商户过滤；不要把代理商的 OrgID 直接和 merchant_id 比较，也不要信任前端传来的商户集合。选择单个商户仍要保留这个过滤条件。
+
+### 敏感读与多步写
+
+主账号专属、账号管理及其他需要即时认定会话的读接口放入 `LiveAuth()` 分组，再配本来需要的权限守卫：
+
+```go
+g := r.Portal("merchant").Group("/order")
+g.LiveAuth().GET("/private-summary", rbac.RequireSuper(), h.privateSummary)
+g.LiveAuth().GET("/orders", rbac.Require(PermOrderList), h.list)
+```
+
+`RequireSuper()` 在主体端表示本主体的主账号。`LiveAuth()` 核对会话和账号状态，不会代替权限码或数据归属检查；需要员工使用的接口用 `Require`，不能一概限制主账号。
+
+多步写操作放进一个 `deps.RBAC.WithActor` 回调，回调里使用传入的 ctx 和重新认定的 actor。主体端会按主体行串行化，账号失效或权限收回时整个操作拒绝。主体事务必须新开，不在外层 `db.Tx` 中再调用 `WithActor`，也不要把同一个业务动作拆成几个各自提交的回调。创建行从 actor.OrgID 写归属；更新时继续应用 scope。需要额外权限时在锁内用 `AllowedLocked`，缓存失效等副作用挂 `db.AfterCommit`。
+
+### 隔离测试
+
+使用真 MySQL，先用 `scope/scopetest.Run` 覆盖 repo 的列表、详情、更新、删除和无主体身份；再用实际主体端令牌覆盖 HTTP 路由。至少验证两个主体互不可见、跨主体 ID 统一 404、主账号权限和员工权限不同、平台/其他端令牌不能通用。代理商场景还要验证其他代理商名下和直属平台商户不可见、商户归属改变后访问范围改变。
+
+写接口还要有在途测试：请求通过入口检查后账号停用、会话吊销或权限收回，必须拒绝且多步数据全部不变。只有 scope 测试不能证明事务和路由守卫正确。
 
 ## 前端
 

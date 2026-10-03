@@ -9,6 +9,7 @@ import { Close } from '@element-plus/icons-vue'
 import GaSidebar from './GaSidebar.vue'
 import GaTopbar from './GaTopbar.vue'
 import GaTabs from './GaTabs.vue'
+import GaFooter from '../components/GaFooter.vue'
 import { useLayoutStore } from './store'
 import { useAuthStore } from '../auth/store'
 import { firstMenuPath, menuTitle } from '../router/menu'
@@ -116,6 +117,8 @@ function toggle() {
           </Transition>
         </RouterView>
       </main>
+      <!-- 版权说明在内容区外面：始终在底部，不随内容滚动，也不盖住内容；内容区最大化时保留（D-119） -->
+      <GaFooter class="ga-layout__footer" />
       <button v-if="layout.maximized" type="button" class="ga-layout__restore" :title="t('shell.layout.restore')" data-test="layout-restore" @click="layout.maximized = false">
         <el-icon><Close /></el-icon>
       </button>

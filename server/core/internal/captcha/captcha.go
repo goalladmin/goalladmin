@@ -6,6 +6,7 @@ package captcha
 import (
 	"bytes"
 	"container/list"
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
@@ -33,11 +34,12 @@ const (
 	idBytes    = 20
 )
 
-// Captcha 是一个验证码生成器；答案存进程内存，v0.1 单实例。
+// Captcha 生成验证码；可选共享存储，本地答案始终只由生成它的实例消费。
 type Captcha struct {
-	now func() time.Time
-	ttl time.Duration
-	max int
+	now    func() time.Time
+	ttl    time.Duration
+	max    int
+	shared *sharedStore
 
 	mu    sync.Mutex
 	items map[string]*list.Element
@@ -46,6 +48,7 @@ type Captcha struct {
 
 type entry struct {
 	id      string
+	scope   string
 	answer  string
 	expires time.Time
 }
@@ -61,15 +64,22 @@ func newCaptcha(now func() time.Time, ttl time.Duration, max int) *Captcha {
 
 // Generate 返回验证码 ID 和 PNG 的 data URL。
 func (c *Captcha) Generate() (id, imageDataURL string, err error) {
+	return c.GenerateFor(context.Background(), "")
+}
+
+// GenerateFor 为指定端生成验证码，ID 的存储归属在创建后不再改变。
+func (c *Captcha) GenerateFor(ctx context.Context, scope string) (id, imageDataURL string, err error) {
+	if err := ctx.Err(); err != nil {
+		return "", "", err
+	}
 	answer, err := randomDigits(Length)
 	if err != nil {
 		return "", "", err
 	}
-	raw := make([]byte, idBytes)
-	if _, err := rand.Read(raw); err != nil {
-		return "", "", fmt.Errorf("captcha: id: %w", err)
+	id, err = randomID()
+	if err != nil {
+		return "", "", err
 	}
-	id = hex.EncodeToString(raw)
 
 	var seed [32]byte
 	if _, err := rand.Read(seed[:]); err != nil {
@@ -81,18 +91,34 @@ func (c *Captcha) Generate() (id, imageDataURL string, err error) {
 	if err := png.Encode(&buf, img); err != nil {
 		return "", "", fmt.Errorf("captcha: encode: %w", err)
 	}
-	c.put(id, answer)
+	id, err = c.store(ctx, scope, id, answer)
+	if err != nil {
+		return "", "", err
+	}
 	return id, "data:image/png;base64," + base64.StdEncoding.EncodeToString(buf.Bytes()), nil
+}
+
+func randomID() (string, error) {
+	var raw [idBytes]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("captcha: id: %w", err)
+	}
+	return hex.EncodeToString(raw[:]), nil
 }
 
 // Verify 校验答案；无论对错都作废该 ID。过期、不存在、空值一律不通过。
 func (c *Captcha) Verify(id, answer string) bool {
+	return c.VerifyFor(context.Background(), "", id, answer)
+}
+
+// VerifyFor 只消费同一个端的验证码；空答案也消耗这次机会。
+func (c *Captcha) VerifyFor(ctx context.Context, scope, id, answer string) bool {
 	answer = strings.TrimSpace(answer)
-	if id == "" || answer == "" {
+	if ctx.Err() != nil || id == "" {
 		return false
 	}
-	want, ok := c.take(id)
-	if !ok {
+	want, ok := c.consume(ctx, scope, id)
+	if !ok || answer == "" || ctx.Err() != nil {
 		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(want), []byte(answer)) == 1
@@ -100,6 +126,10 @@ func (c *Captcha) Verify(id, answer string) bool {
 
 // Peek 只查看答案（测试用），不作废；不存在或已过期时返回空串。
 func (c *Captcha) Peek(id string) string {
+	if c.shared != nil && validID(id, 'r') {
+		answer, _ := c.shared.read(context.Background(), "peek", "", id, c.now())
+		return answer
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	el, ok := c.items[id]
@@ -113,7 +143,7 @@ func (c *Captcha) Peek(id string) string {
 	return e.answer
 }
 
-func (c *Captcha) put(id, answer string) {
+func (c *Captcha) put(scope, id, answer string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := c.now()
@@ -124,14 +154,14 @@ func (c *Captcha) put(id, answer string) {
 	for c.order.Len() >= c.max {
 		c.removeLocked(c.order.Front())
 	}
-	c.items[id] = c.order.PushBack(&entry{id: id, answer: answer, expires: now.Add(c.ttl)})
+	c.items[id] = c.order.PushBack(&entry{id: id, scope: scope, answer: answer, expires: now.Add(c.ttl)})
 }
 
-func (c *Captcha) take(id string) (string, bool) {
+func (c *Captcha) take(scope, id string) (string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	el, ok := c.items[id]
-	if !ok {
+	if !ok || el.Value.(*entry).scope != scope {
 		return "", false
 	}
 	c.removeLocked(el)

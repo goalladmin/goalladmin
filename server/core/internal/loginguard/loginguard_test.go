@@ -58,12 +58,82 @@ func TestRateLimit(t *testing.T) {
 	}
 	require.True(t, g.Check("u99", "1.1.1.1").RateLimited, "同 IP 第 21 次")
 	for i := 0; i < 10; i++ {
-		require.False(t, g.Check("bob", fmt.Sprintf("10.0.0.%d", i)).RateLimited)
+		d := g.Check("bob", fmt.Sprintf("10.0.0.%d", i))
+		require.False(t, d.RateLimited)
+		require.False(t, d.CaptchaRequired)
 	}
-	require.True(t, g.Check("bob", "10.0.0.99").RateLimited, "同账号第 11 次")
+	// 同账号第 11 次：不拒绝，改为必须带验证码（D-103）
+	d := g.Check("bob", "10.0.0.99")
+	require.False(t, d.RateLimited, "同账号第 11 次不拒绝")
+	require.True(t, d.CaptchaRequired, "同账号第 11 次要验证码")
+	require.NotNil(t, d.Attempt)
 	*now = now.Add(61 * time.Second)
 	require.False(t, g.Check("u99", "1.1.1.1").RateLimited)
-	require.False(t, g.Check("bob", "10.0.0.99").RateLimited)
+	d = g.Check("bob", "10.0.0.99")
+	require.False(t, d.RateLimited)
+	require.False(t, d.CaptchaRequired, "换了窗口，次数重新计")
+}
+
+// 规范 §13.2 第 187 条（D-103）：账号的请求次数超限不拒绝、改为要求验证码；没过验证码的请求不占账号的次数，
+// 所以不解验证码的来源不能让别的来源多出一道验证码；退回只退自己记进去的那一次。
+func TestGuard_187_AccountRateRequiresCaptchaAndRefund(t *testing.T) {
+	g, now := newGuard()
+	// 一个来源：三次密码错误之后，它自己每次都要验证码
+	for i := 0; i < 3; i++ {
+		d := g.Check("alice", "198.51.100.7")
+		require.False(t, d.CaptchaRequired)
+		d.Attempt.Fail()
+	}
+	// 它不带验证码继续发 15 次（来源的每分钟 20 次还没到）：每次都要验证码，没过的不占账号的次数
+	for i := 0; i < 15; i++ {
+		d := g.Check("alice", "198.51.100.7")
+		require.False(t, d.RateLimited)
+		require.True(t, d.CaptchaRequired)
+		d.Attempt.CaptchaFailed()
+	}
+	// 另一个来源照常登录，不需要验证码（没有退回的话这里已经是第 19 次）
+	victim := g.Check("alice", "203.0.113.5")
+	require.False(t, victim.RateLimited)
+	require.False(t, victim.CaptchaRequired, "不解验证码的来源不能让别的来源多出一道验证码")
+	victim.Attempt.Succeed()
+
+	// 过了验证码、真去核对密码的请求照样算数：再来 6 个来源各一次，凑满 10 次；第 11 次起要验证码
+	for i := 0; i < 6; i++ {
+		d := g.Check("alice", fmt.Sprintf("192.0.2.%d", i))
+		require.False(t, d.CaptchaRequired, i)
+		d.Attempt.Fail()
+	}
+	over := g.Check("alice", "192.0.2.99")
+	require.False(t, over.RateLimited)
+	require.True(t, over.CaptchaRequired)
+	// 结束方法只生效一次：退回之后再调 Done、再退一次都不再改次数
+	over.Attempt.CaptchaFailed()
+	over.Attempt.CaptchaFailed()
+	over.Attempt.Done()
+	again := g.Check("alice", "192.0.2.98")
+	require.True(t, again.CaptchaRequired, "只退了一次：这一次仍是第 11 次")
+	again.Attempt.Done()
+
+	// 窗口换了之后再退回：不动新窗口里的次数
+	*now = now.Add(61 * time.Second)
+	stale := g.Check("carol", "192.0.2.1")
+	*now = now.Add(61 * time.Second)
+	for i := 0; i < 10; i++ {
+		d := g.Check("carol", fmt.Sprintf("192.0.2.%d", 10+i))
+		require.False(t, d.CaptchaRequired, i)
+		d.Attempt.Done()
+	}
+	stale.Attempt.CaptchaFailed()
+	d := g.Check("carol", "192.0.2.50")
+	require.True(t, d.CaptchaRequired, "旧窗口的尝试退回不能减掉新窗口的次数")
+	d.Attempt.Done()
+
+	// 没被接纳的尝试（nil）也可以调用
+	var none *Attempt
+	none.CaptchaFailed()
+	// 不经过登录限流的准入（锁屏解锁）没有记次数，退回什么都不改
+	g.Admit("dave", "192.0.2.1").CaptchaFailed()
+	require.False(t, g.Check("dave", "192.0.2.2").CaptchaRequired)
 }
 
 func TestFailuresExpireWithWindow(t *testing.T) {

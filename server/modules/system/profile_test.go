@@ -242,12 +242,15 @@ func TestProfile_112_AdminInputsValidatedLikeSelfService(t *testing.T) {
 	r = f.do(root, "PUT", fmt.Sprintf("/system/users/%d", id), gin.H{"displayName": "  frank  ", "bio": "多行\n简介"})
 	require.Equal(t, 0, r.env.Code, r.rec.Body.String())
 
-	for _, c := range []struct{ method, path string }{
-		{"POST", "/system/users"},
-		{"POST", "/system/roles"},
-		{"POST", "/system/dicts"},
+	for _, c := range []struct {
+		method, path string
+		body         gin.H
+	}{
+		{"POST", "/system/users", gin.H{"username": "george", "sort": 5_000_000_000}},
+		{"POST", "/system/roles", gin.H{"code": "george", "name": "george", "sort": 5_000_000_000}},
+		{"POST", "/system/dicts", gin.H{"code": "george", "name": "george", "sort": 5_000_000_000}},
 	} {
-		body := gin.H{"username": "george", "code": "george", "name": "george", "sort": 5_000_000_000}
+		body := c.body
 		r := f.do(root, c.method, c.path, body)
 		require.Equal(t, 200, r.rec.Code, c.path+" "+r.rec.Body.String())
 		require.Equal(t, httpx.CodeValidation, r.env.Code, c.path+" "+r.rec.Body.String())

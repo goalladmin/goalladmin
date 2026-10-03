@@ -38,3 +38,12 @@ export function splitDuration(seconds: number): { d: number; h: number; m: numbe
   const m = Math.floor(v / 60)
   return { d, h, m, s: v - m * 60 }
 }
+
+/** 把 ISO 时间格式化成本地时间；空值返回空串。 */
+export function formatTime(v: string | null | undefined): string {
+  if (!v) return ''
+  const d = new Date(v)
+  if (Number.isNaN(d.getTime())) return v
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}

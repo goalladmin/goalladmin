@@ -3,6 +3,7 @@ import globals from 'globals'
 import pluginVue from 'eslint-plugin-vue'
 import tseslint from 'typescript-eslint'
 import vueParser from 'vue-eslint-parser'
+import { boundary } from '@ga/shell/eslint'
 
 export default tseslint.config(
   { ignores: ['node_modules/**', 'dist/**', 'playwright-report/**', 'test-results/**'] },
@@ -33,4 +34,6 @@ export default tseslint.config(
       '@typescript-eslint/consistent-type-imports': 'error',
     },
   },
+  // 只能引用本应用目录里的文件和 @ga/shell（D-064）
+  boundary(import.meta.dirname),
 )

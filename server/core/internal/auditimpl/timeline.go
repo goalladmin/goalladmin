@@ -55,6 +55,10 @@ func parseCursor(s string) (cursor, error) {
 	if err != nil {
 		return cursor{}, audit.ErrBadCursor
 	}
+	// 换算成 UTC 后年份超出 1–9999 的时间数据库驱动不接受（D-099）
+	if y := at.UTC().Year(); y < 1 || y > 9999 {
+		return cursor{}, audit.ErrBadCursor
+	}
 	rank := typeRank(parts[1])
 	id, err := strconv.ParseUint(parts[2], 10, 64)
 	if rank == 0 || err != nil {
@@ -107,7 +111,7 @@ func (r *Recorder) Timeline(ctx context.Context, q audit.TimelineQuery) (audit.T
 	fetch := limit + 1
 	scope := func(db *gorm.DB, typ, timeCol string) *gorm.DB {
 		switch {
-		case q.Portal != "" && typ == audit.TimelineSecurity:
+		case q.Portal != "" && q.IncludeGlobal && typ == audit.TimelineSecurity:
 			db = db.Where("portal IN (?, '')", q.Portal)
 		case q.Portal != "":
 			db = db.Where("portal = ?", q.Portal)

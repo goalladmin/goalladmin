@@ -15,6 +15,10 @@ type Perm struct {
 	Portal    string // 属于哪个端
 	Group     string // 授权界面上的分组
 	Sensitive bool   // 敏感权限：只有超管能授予（规范 §6.5）
+	// RoleView 表示拥有这个权限码就能看角色的权限码和数据范围（D-069）：分配角色、重新启用角色被拒时，只有拥有这类权限码的
+	// 操作人能看到是角色里的哪个权限码、哪个范围挡住了，别人只知道"不能分配"。看角色权限的接口用哪个权限码守着，就给
+	// 哪个权限码声明它；一个端没有声明这类权限码时，非超管都只看到笼统的拒绝。
+	RoleView bool
 }
 
 // MenuNode 是模块声明的一个菜单节点（规范 §6.6）。
@@ -28,6 +32,7 @@ type MenuNode struct {
 	Icon      string
 	Perm      string // 可见所需的权限码；空表示登录即可见
 	Sort      int    // 越小越靠前
+	SuperOnly bool   // 仅超管（主体端主账号）可见，代码祖先的限制同样继承
 	KeepAlive bool
 	Hidden    bool // 不在侧边栏显示但仍注册路由（如详情页）
 }

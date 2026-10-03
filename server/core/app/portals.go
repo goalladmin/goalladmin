@@ -45,8 +45,9 @@ func (a *App) SetAuthorizer(z Authorizer) {
 // setupPortals 在模块 Init 之后、Routes 之前执行：为每个已注册的端建路由组、认证器和 /auth 接口。
 func (a *App) setupPortals() error {
 	if a.captcha == nil {
-		a.captcha = captcha.New()
+		a.captcha = captcha.NewShared(a.now, a.redis)
 	}
+	a.deps.VerifyCaptcha = a.captcha.VerifyFor
 	for _, p := range a.deps.Portals.All() {
 		cfgP, ok := a.deps.Conf.Portals[p.Code]
 		if !ok {
@@ -73,8 +74,13 @@ func (a *App) setupPortals() error {
 		if refreshTTL <= 0 {
 			refreshTTL = cfgP.RefreshTTL
 		}
+		var ipCheck authimpl.IPChecker
+		if a.deps.IPACL != nil {
+			ipCheck = a.deps.IPACL
+		}
 		an, err := authimpl.New(authimpl.Options{
 			Portal:         p,
+			IPACL:          ipCheck,
 			Secret:         secret,
 			AccessTTL:      accessTTL,
 			RefreshTTL:     refreshTTL,
@@ -82,11 +88,14 @@ func (a *App) setupPortals() error {
 			AllowedOrigins: a.deps.Conf.Server.AllowedOrigins,
 			Log:            a.deps.Log,
 			Now:            a.now,
-			BcryptCost:     a.bcryptCost,
+			Hasher:         a.hasher,
 			Captcha:        a.captcha,
 			StatusCacheTTL: a.statusCacheTTL,
-			// 只有测试会改（同包的测试直接设字段），0 用默认值
-			PasswordParallel: a.pwdParallel,
+			Redis:          a.redis,
+			// 整个进程共用一个（D-068）
+			PasswordBudget:  a.pwdBudget,
+			OnSessionChange: func(sid string) { a.publishInvalidation("session", p.Code, sid) },
+			OnAccountChange: func(userID uint64) { a.publishAccount(p.Code, userID) },
 		})
 		if err != nil {
 			return err
@@ -95,7 +104,8 @@ func (a *App) setupPortals() error {
 			an.SetAuthorizer(a.authorizer)
 		}
 		a.authenticators[p.Code] = an
-		a.portalGroups[p.Code] = a.engine.Group(PortalPrefix(p.Code))
+		// 端白名单（D-062）挂在端的路由组上：这个端的每个接口都查，包括不需要登录的
+		a.portalGroups[p.Code] = a.engine.Group(PortalPrefix(p.Code), a.ipPortalMiddleware(p.Code))
 	}
 	if a.guardResolver == nil {
 		a.guardResolver = a.resolveGuard
@@ -179,8 +189,20 @@ func mergePassword(code portal.PasswordPolicy, c conf.PortalPassword) portal.Pas
 	return p
 }
 
-// resolveGuard 把守卫声明翻译成中间件链。
+// resolveGuard 把守卫声明翻译成中间件链。主体端的非公开路由在守卫链最后加上主体参数守卫（D-067 第 5 条）：
+// 排在认证之后，没登录的请求不读请求体。
 func (a *App) resolveGuard(portalCode string, g Guard) ([]gin.HandlerFunc, error) {
+	chain, err := a.guardChain(portalCode, g)
+	if err != nil || len(chain) == 0 {
+		return chain, err
+	}
+	if p, ok := a.deps.Portals.Get(portalCode); ok && p.Scoped {
+		chain = append(chain, a.orgParamGuard())
+	}
+	return chain, nil
+}
+
+func (a *App) guardChain(portalCode string, g Guard) ([]gin.HandlerFunc, error) {
 	an, ok := a.authenticators[portalCode]
 	if !ok {
 		return nil, fmt.Errorf("端 %s 没有认证器", portalCode)
@@ -219,6 +241,8 @@ func (a *App) mountAuthRoutes(code string) {
 	r.Handle(http.MethodPost, "/unlock", rbac.AuthOnly(), an.Unlock, WithOpName(OpUnlock), WithMiddleware(oplogimpl.Middleware(code, OpUnlock)))
 	prefix := PortalPrefix(code) + "/auth"
 	an.ExemptFromLock(prefix+"/me", prefix+"/unlock", prefix+"/logout")
+	// 换到账号白名单之外的 IP 之后仍能登出（只吊销自己的会话，D-062）
+	an.ExemptFromAccountIP(prefix + "/logout")
 	r.Handle(http.MethodPut, "/password", rbac.AuthOnly(), an.ChangePassword, WithOpName(OpChangePassword), WithMiddleware(oplogimpl.Middleware(code, OpChangePassword)))
 }
 
@@ -354,7 +378,7 @@ func (s *authService) ListSessionsIn(ctx context.Context, portalCode string, use
 func sessionInfos(rows []session.Session) []auth.SessionInfo {
 	out := make([]auth.SessionInfo, 0, len(rows))
 	for _, r := range rows {
-		out = append(out, auth.SessionInfo{SID: r.SID, Portal: r.Portal, UserID: r.UserID, IP: r.IP, UserAgent: r.UserAgent, CreatedAt: r.CreatedAt, LastSeenAt: r.LastSeenAt, ExpiresAt: r.ExpiresAt})
+		out = append(out, auth.SessionInfo{SID: r.SID, Portal: r.Portal, OrgID: r.OrgID, UserID: r.UserID, IP: r.IP, UserAgent: r.UserAgent, CreatedAt: r.CreatedAt, LastSeenAt: r.LastSeenAt, ExpiresAt: r.ExpiresAt})
 	}
 	return out
 }
@@ -369,7 +393,7 @@ func (s *authService) ListLoginLogs(ctx context.Context, f auth.LoginLogFilter, 
 		return nil, 0, errors.New("auth: 没有任何端")
 	}
 	rows, total, err := first.Sessions().ListLoginLogs(ctx, session.LoginLogFilter{
-		Portal: f.Portal, UserID: f.UserID, Username: f.Username, IP: f.IP, SessionID: f.SessionID, Success: f.Success, From: f.From, To: f.To,
+		Portal: f.Portal, OrgID: f.OrgID, UserID: f.UserID, Username: f.Username, IP: f.IP, SessionID: f.SessionID, Success: f.Success, From: f.From, To: f.To,
 	}, page, pageSize)
 	if err != nil {
 		return nil, 0, err
@@ -377,7 +401,7 @@ func (s *authService) ListLoginLogs(ctx context.Context, f auth.LoginLogFilter, 
 	out := make([]auth.LoginLogInfo, 0, len(rows))
 	for _, r := range rows {
 		out = append(out, auth.LoginLogInfo{
-			ID: r.ID, Portal: r.Portal, Username: r.Username, UserID: r.UserID, SessionID: r.SessionID, Success: r.Success, Reason: r.Reason,
+			ID: r.ID, Portal: r.Portal, OrgID: r.OrgID, OrgCode: r.OrgCode, Username: r.Username, UserID: r.UserID, SessionID: r.SessionID, Success: r.Success, Reason: r.Reason,
 			IP: r.IP, UserAgent: r.UserAgent, RequestID: r.RequestID, CreatedAt: r.CreatedAt,
 		})
 	}

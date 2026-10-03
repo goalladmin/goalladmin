@@ -321,10 +321,10 @@ func TestAvatar_61_AdminCanOnlyClear(t *testing.T) {
 	set(w.aliceTok)
 	set(w.olgaTok)
 
-	// 管理员改资料时传 avatar 不改头像
+	// 管理资料 DTO 不接受 avatar 字段（D-108），拒绝后头像不改变
 	aliceAvatar := f.avatarOf(w.alice)
 	r := f.do(w.root, "PUT", fmt.Sprintf("/system/users/%d", w.alice), gin.H{"displayName": "Alice", "avatar": "https://evil.example/a.png"})
-	require.Equal(t, 0, r.env.Code, r.rec.Body.String())
+	require.Equal(t, httpx.CodeBadRequest, r.env.Code, r.rec.Body.String())
 	require.Equal(t, aliceAvatar, f.avatarOf(w.alice))
 
 	// 本部门范围的管理员：范围外 404，范围内可以清除

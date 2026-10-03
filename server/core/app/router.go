@@ -29,7 +29,9 @@ type Route struct {
 	Guard  rbac.GuardKind
 	Perm   string
 	OpName string // 操作日志的动作名；空表示不记
-	extra  []gin.HandlerFunc
+	// LiveAuth 表示这条路由的认证按库核对会话和账号状态、不用状态缓存（D-073）。公开路由不认证，恒为 false
+	LiveAuth bool
+	extra    []gin.HandlerFunc
 }
 
 // RouteOption 修饰一条路由：附加中间件、设置操作日志名。
@@ -87,11 +89,22 @@ type PortalRouter struct {
 	portal string
 	group  *gin.RouterGroup
 	prefix string
+	live   bool // 这个分组下的路由按库核对（LiveAuth）
 }
 
-// Group 建子分组。mws 是分组级中间件，排在守卫之前。
+// Group 建子分组。mws 是分组级中间件，排在守卫之前。子分组继承 LiveAuth。
 func (p *PortalRouter) Group(rel string, mws ...gin.HandlerFunc) *PortalRouter {
-	return &PortalRouter{app: p.app, portal: p.portal, group: p.group.Group(rel, mws...), prefix: joinPath(p.prefix, rel)}
+	return &PortalRouter{app: p.app, portal: p.portal, group: p.group.Group(rel, mws...), prefix: joinPath(p.prefix, rel), live: p.live}
+}
+
+// LiveAuth 返回同一个分组的另一个注册入口：用它注册的路由（包括它的子分组），认证时按库核对会话和账号状态，
+// 不用状态缓存（D-073）。代价是每个请求多几条主键查询，换来的是别的程序在库里吊销会话、停用账号或主体、
+// 更换主账号之后，这些路由在下一个请求就按新状态处理。只管认证这一步：角色和权限码仍按授权快照判断，
+// IP 名单仍按它自己的快照。用在只有少数人看的敏感内容上（主体端的后台）；量大的业务接口不要标。
+func (p *PortalRouter) LiveAuth() *PortalRouter {
+	cp := *p
+	cp.live = true
+	return &cp
 }
 
 // Handle 注册一条路由。守卫是必填参数，漏写编译不过。
@@ -110,7 +123,8 @@ func (p *PortalRouter) Handle(method, rel string, g Guard, h gin.HandlerFunc, op
 	if g.Kind() == rbac.GuardRequire && g.Perm() == "" {
 		panic(fmt.Sprintf("app: 路由 %s %s 的 Require 守卫没有权限码", method, joinPath(p.prefix, rel)))
 	}
-	rt := Route{Portal: p.portal, Method: method, Path: joinPath(p.prefix, rel), Guard: g.Kind(), Perm: g.Perm()}
+	rt := Route{Portal: p.portal, Method: method, Path: joinPath(p.prefix, rel), Guard: g.Kind(), Perm: g.Perm(),
+		LiveAuth: p.live && g.Kind() != rbac.GuardPublic}
 	for _, o := range opts {
 		o(&rt)
 	}
@@ -121,7 +135,11 @@ func (p *PortalRouter) Handle(method, rel string, g Guard, h gin.HandlerFunc, op
 	if err != nil {
 		panic(fmt.Sprintf("app: 路由 %s %s 的守卫无法解析: %v", method, rt.Path, err))
 	}
-	handlers := make([]gin.HandlerFunc, 0, len(chain)+len(rt.extra)+1)
+	handlers := make([]gin.HandlerFunc, 0, len(chain)+len(rt.extra)+2)
+	if rt.LiveAuth {
+		// 标记排在守卫链（认证）前面，跟着这条路由自己的处理链走；守卫链已经解析出来了，这个端的认证器一定在
+		handlers = append(handlers, p.app.authenticators[p.portal].LiveAuth())
+	}
 	handlers = append(handlers, chain...)
 	handlers = append(handlers, rt.extra...)
 	handlers = append(handlers, h)

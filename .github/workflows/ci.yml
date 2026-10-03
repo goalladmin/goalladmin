@@ -24,7 +24,18 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
+      # 框架支持的最低版本（D-074）：测试在最低版本上通过，才敢说支持它
+      redis:
+        image: redis:6.0
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     env:
+      GA_TEST_REDIS: 127.0.0.1:6380
       # 测试需要建临时库，所以 CI 里用 root
       GA_TEST_DSN: root:root_test_pw@tcp(127.0.0.1:3307)/goalladmin_test?charset=utf8mb4&parseTime=true&loc=UTC&multiStatements=true
     steps:

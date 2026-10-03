@@ -88,6 +88,12 @@ export interface MenuTree {
 }
 
 /** /auth/me 的出参。 */
+/** 主体端（代理商、商户）当前账号所属的主体（D-061）。 */
+export interface MeOrg {
+  code: string
+  name: string
+}
+
 export interface MeResponse {
   user: MeUser
   perms: string[]
@@ -95,6 +101,8 @@ export interface MeResponse {
   pwdPolicy?: PwdPolicy
   /** 会话处于锁屏状态（D-027）；这时 perms、menus 为空。 */
   locked?: boolean
+  /** 只有主体端有：当前账号所属的主体。 */
+  org?: MeOrg
 }
 
 /** 业务错误码（server/core/httpx/codes.go）。前端只关心需要特殊处理的几个。 */
@@ -107,6 +115,8 @@ export const Codes = {
   RefreshRetry: 1005,
   Forbidden: 2001,
   PwdChangeRequired: 2002,
+  /** 当前 IP 不允许访问：IP 黑名单、白名单（D-062）。 */
+  IPDenied: 2003,
   SessionLocked: 1006,
   Validation: 3001,
   BadRequest: 3002,

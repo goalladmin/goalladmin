@@ -1,6 +1,6 @@
 {
   "name": "@ga/platform",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "GoAllAdmin 平台端：系统管理页面、业务页面",
   "type": "module",
@@ -10,12 +10,12 @@
     "preview": "vite preview",
     "lint": "eslint .",
     "typecheck": "vue-tsc --noEmit -p tsconfig.json",
-    "test": "echo '平台端没有单元测试；壳的单元测试在 packages/shell，冒烟测试是 npm run e2e'",
+    "test": "vitest run",
     "e2e": "playwright test"
   },
   "dependencies": {
     "@element-plus/icons-vue": "2.3.2",
-    "@ga/shell": "0.1.0",
+    "@ga/shell": "0.2.0",
     "echarts": "6.1.0",
     "element-plus": "2.14.6",
     "vue": "3.5.43",
@@ -26,12 +26,15 @@
     "@playwright/test": "1.63.0",
     "@types/node": "22.20.4",
     "@vitejs/plugin-vue": "6.0.9",
+    "@vue/test-utils": "2.5.1",
     "eslint": "10.11.0",
     "eslint-plugin-vue": "10.11.0",
     "globals": "17.12.0",
+    "jsdom": "30.1.0",
     "typescript": "5.9.3",
     "typescript-eslint": "8.70.0",
     "vite": "8.3.0",
+    "vitest": "5.0.1",
     "vue-eslint-parser": "10.4.1",
     "vue-tsc": "3.3.11"
   }

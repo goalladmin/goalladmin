@@ -1,8 +1,7 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 
-import { buildId } from './build/build-id.ts'
-import { thirdPartyLicenses } from './build/third-party-licenses.ts'
+import { buildId, thirdPartyLicenses } from '@ga/shell/vite'
 
 // 开发和预览都把 /api 反代到后端，前后端同源（规范 §5.2）。后端地址用 GA_API_TARGET 覆盖。
 const apiTarget = process.env.GA_API_TARGET ?? 'http://127.0.0.1:8080'

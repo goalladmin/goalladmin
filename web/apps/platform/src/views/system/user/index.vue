@@ -1,13 +1,14 @@
 <script setup lang="ts">
-import { computed, reactive, ref } from 'vue'
+import { computed, onActivated, onBeforeUnmount, onDeactivated, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { FormInstance, FormRules } from 'element-plus'
-import { GaAvatar, formatTime, useAuthStore, useI18n, useTable } from '@ga/shell'
+import { GaAvatar, describeApiError, formatTime, isApiError, useAuthStore, useI18n, useTable } from '@ga/shell'
 
+import IpAllowEditor from '../../../components/IpAllowEditor.vue'
 import { buildTree, deptApi, postApi, roleApi, userApi } from '../../../api/system'
-import type { CreateUserInput, DeptOption, PostOption, Role, TreeNode, TreeOption, UpdateUserInput, UserView } from '../../../api/system'
+import type { CreateUserInput, DeptOption, IPEntry, PostOption, Role, TreeNode, TreeOption, UpdateUserInput, UserView } from '../../../api/system'
 
-const { t } = useI18n()
+const { t, te } = useI18n()
 const auth = useAuthStore()
 
 // ---- 列表 ----
@@ -74,6 +75,7 @@ const rules = computed<FormRules>(() => ({
 }))
 
 function openCreate() {
+  formSeq++
   dialog.mode = 'create'
   dialog.id = 0
   Object.assign(form, { username: '', password: '', displayName: '', email: '', phone: '', roleIds: [], deptId: undefined, postIds: [], sort: 0, remark: '', bio: '' })
@@ -82,6 +84,7 @@ function openCreate() {
 }
 
 function openEdit(u: UserView) {
+  formSeq++
   dialog.mode = 'edit'
   dialog.id = u.id
   const postIds = u.posts.map((p) => p.id)
@@ -92,11 +95,44 @@ function openEdit(u: UserView) {
 
 // 只显示一次的初始密码
 const reveal = reactive({ visible: false, username: '', password: '' })
+let pageActive = true
+let pageSeq = 0
+let formSeq = 0
+let resetSeq = 0
+const resetting = ref(false)
+function clearSecrets() {
+  pageSeq++
+  resetSeq++
+  resetting.value = false
+  form.password = ''
+  dialog.visible = false
+  dialog.saving = false
+  Object.assign(reveal, { visible: false, username: '', password: '' })
+}
+onActivated(() => { pageActive = true })
+onDeactivated(() => { pageActive = false; clearSecrets() })
+onBeforeUnmount(() => { pageActive = false; clearSecrets() })
+watch(() => [auth.epoch, auth.locked], clearSecrets, { flush: 'sync' })
+watch(() => dialog.visible, (open) => {
+  formSeq++
+  if (!open) {
+    form.password = ''
+    dialog.saving = false
+  }
+}, { flush: 'sync' })
 function showPassword(username: string, password: string) {
   reveal.username = username
   reveal.password = password
   reveal.visible = true
 }
+// 关掉就清空（D-098）：明文不留在页面状态和隐藏的节点里
+watch(() => reveal.visible, (open) => {
+  if (!open) {
+    resetSeq++
+    resetting.value = false
+    Object.assign(reveal, { username: '', password: '' })
+  }
+}, { flush: 'sync' })
 async function copyPassword() {
   try {
     await navigator.clipboard.writeText(reveal.password)
@@ -107,15 +143,14 @@ async function copyPassword() {
 }
 
 async function submit() {
-  if (!formRef.value) return
-  try {
-    await formRef.value.validate()
-  } catch {
-    return
-  }
+  if (!formRef.value || !pageActive || !dialog.visible || dialog.saving || auth.locked) return
+  const target = { page: pageSeq, form: formSeq, epoch: auth.epoch, mode: dialog.mode, id: dialog.id }
+  const current = () => pageActive && !auth.locked && pageSeq === target.page && formSeq === target.form && auth.epoch === target.epoch && dialog.visible && dialog.mode === target.mode && dialog.id === target.id
   dialog.saving = true
   try {
-    if (dialog.mode === 'create') {
+    await formRef.value.validate()
+    if (!current()) return
+    if (target.mode === 'create') {
       const res = await userApi.create({
         username: form.username.trim(),
         password: form.password || undefined,
@@ -128,11 +163,12 @@ async function submit() {
         sort: form.sort,
         remark: form.remark,
       })
+      if (!current()) return
       dialog.visible = false
       ElMessage.success(t('common.success'))
       if (res.initialPassword) showPassword(res.user.username, res.initialPassword)
     } else {
-      await userApi.update(dialog.id, {
+      await userApi.update(target.id, {
         displayName: form.displayName,
         email: form.email,
         phone: form.phone,
@@ -142,6 +178,7 @@ async function submit() {
         remark: form.remark,
         bio: form.bio,
       })
+      if (!current()) return
       dialog.visible = false
       ElMessage.success(t('common.success'))
     }
@@ -149,7 +186,7 @@ async function submit() {
   } catch {
     // 统一提示已经弹过
   } finally {
-    dialog.saving = false
+    if (current()) dialog.saving = false
   }
 }
 
@@ -184,14 +221,45 @@ async function clearAvatar(u: UserView) {
 }
 
 async function resetPassword(u: UserView) {
+  if (!pageActive || resetting.value || auth.locked) return
+  const target = { page: pageSeq, epoch: auth.epoch, id: u.id, username: u.username }
+  const my = ++resetSeq
+  const current = () => pageActive && !auth.locked && pageSeq === target.page && auth.epoch === target.epoch && my === resetSeq
+  resetting.value = true
   try {
-    await ElMessageBox.confirm(t('sys.user.confirmReset', { name: u.username }), t('common.confirmTitle'), { type: 'warning' })
+    await ElMessageBox.confirm(t('sys.user.confirmReset', { name: target.username }), t('common.confirmTitle'), { type: 'warning' })
+    if (!current()) return
+    const res = await userApi.resetPassword(target.id)
+    if (!current()) return
+    showPassword(target.username, res.initialPassword)
+    await table.reload()
   } catch {
-    return
+    // 取消或失败由请求层提示，失去页面身份的结果不展示。
+  } finally {
+    if (my === resetSeq) resetting.value = false
   }
-  const res = await userApi.resetPassword(u.id)
-  showPassword(u.username, res.initialPassword)
-  await table.reload()
+}
+
+// ---- 账号的 IP 白名单（D-062） ----
+const ipDialog = reactive({ visible: false, id: 0, username: '', items: [] as IPEntry[], yourIp: '', saving: false, error: '' })
+async function openIP(u: UserView) {
+  const v = await userApi.ipAllow(u.id)
+  Object.assign(ipDialog, { id: u.id, username: u.username, items: v.items.map((r) => ({ cidr: r.cidr, remark: r.remark })), yourIp: v.yourIp, error: '' })
+  ipDialog.visible = true
+}
+async function saveIP() {
+  ipDialog.error = ''
+  ipDialog.saving = true
+  try {
+    const items = ipDialog.items.filter((e) => e.cidr.trim() !== '').map((e) => ({ cidr: e.cidr.trim(), remark: e.remark.trim() }))
+    await userApi.setIPAllow(ipDialog.id, items)
+    ipDialog.visible = false
+    ElMessage.success(t('common.success'))
+  } catch (e) {
+    if (isApiError(e)) ipDialog.error = describeApiError(e, (k, p) => t(k, p ?? {}), (k) => te(k) || te(k, 'en-US')).join(t('shell.error.listSep'))
+  } finally {
+    ipDialog.saving = false
+  }
 }
 
 const roleDialog = reactive({ visible: false, id: 0, username: '', roleIds: [] as number[], saving: false })
@@ -288,17 +356,18 @@ async function saveRoles() {
         <el-table-column :label="t('common.createdAt')" min-width="170">
           <template #default="{ row }">{{ formatTime((row as UserView).createdAt) }}</template>
         </el-table-column>
-        <el-table-column :label="t('common.actions')" width="360" fixed="right">
+        <el-table-column :label="t('common.actions')" width="440" fixed="right">
           <template #default="{ row }">
             <el-tooltip :disabled="!lockedForMe(row as UserView)" :content="t('sys.user.superProtectedHint')" placement="top">
               <span class="ga-user__actions" :data-test="`user-actions-${(row as UserView).username}`">
                 <el-button v-perm="'system:user:update'" link type="primary" :disabled="lockedForMe(row as UserView)" @click="openEdit(row as UserView)">{{ t('common.edit') }}</el-button>
                 <el-button v-perm="'system:user:assign-role'" link type="primary" :disabled="lockedForMe(row as UserView)" @click="openRoles(row as UserView)">{{ t('sys.user.assignRoles') }}</el-button>
+                <el-button v-perm="'system:user:ip'" link type="primary" :disabled="lockedForMe(row as UserView)" data-test="user-ip-allow" @click="openIP(row as UserView)">{{ t('ipacl.userAllow') }}</el-button>
                 <el-button
                   v-if="auth.user?.super"
                   link
                   type="warning"
-                  :disabled="isSuperRow(row as UserView)"
+                  :disabled="isSuperRow(row as UserView) || resetting"
                   :title="isSuperRow(row as UserView) ? t('sys.user.resetSuperHint') : ''"
                   data-test="user-reset-password"
                   @click="resetPassword(row as UserView)"
@@ -412,7 +481,17 @@ async function saveRoles() {
       </template>
     </el-dialog>
 
-    <el-dialog v-model="reveal.visible" :title="t('sys.user.initialPasswordTitle')" width="420px" data-test="password-reveal">
+    <el-dialog v-model="ipDialog.visible" :title="t('ipacl.userAllowTitle', { name: ipDialog.username })" width="640px" data-test="user-ip-dialog">
+      <el-alert :title="t('ipacl.userAllowHint')" type="info" :closable="false" show-icon style="margin-bottom: 12px" />
+      <IpAllowEditor v-model="ipDialog.items" :your-ip="ipDialog.yourIp" />
+      <el-alert v-if="ipDialog.error" :title="ipDialog.error" type="error" :closable="false" show-icon style="margin-top: 12px" />
+      <template #footer>
+        <el-button @click="ipDialog.visible = false">{{ t('common.cancel') }}</el-button>
+        <el-button type="primary" :loading="ipDialog.saving" data-test="user-ip-save" @click="saveIP">{{ t('common.save') }}</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="reveal.visible" :title="t('sys.user.initialPasswordTitle')" width="420px" destroy-on-close data-test="password-reveal">
       <el-alert :title="t('sys.user.initialPasswordHint')" type="warning" :closable="false" show-icon />
       <el-descriptions :column="1" border style="margin-top: 12px">
         <el-descriptions-item :label="t('common.username')">{{ reveal.username }}</el-descriptions-item>

@@ -57,7 +57,7 @@
 ## 前端
 
 - 页面放在 `web/apps/<端>/src/views/` 下，路径就是后端菜单声明里的 `Component`：`system/user/index` ↔ `views/system/user/index.vue`。映射表来自 `import.meta.glob`，不在表里的键渲染 404，禁止拼接路径动态 import。
-- 业务页面只从 `@ga/shell` 引用框架能力（`useRequest`、`useAuthStore`、`useTable`、`useI18n`、`formatTime`、`hasPerm` 等）；`@ga/shell` 的 `exports` 只开放包根和 `./styles`，深层路径 import 会被拒绝。
+- 业务页面只从 `@ga/shell` 引用框架能力（`useRequest`、`useAuthStore`、`useTable`、`useI18n`、`formatTime`、`hasPerm` 等）；`@ga/shell` 的 `exports` 只开放包根和 `./styles`（另有给应用的 ESLint 配置用的 `./eslint`），深层路径 import 会被拒绝。每个端的应用只能引用自己目录里的文件和 `@ga/shell`，不能用相对路径或包名引用别的端，ESLint 规则 `ga/boundary` 检查（D-064）。
 - 接口调用集中在 `src/api/*.ts`，页面不直接拼 URL；类型与 `docs/api.md` 对应。
 - 文案键：菜单 `menu.<name>`、权限分组 `permGroup.<group>`、权限名 `perm.<a>.<b>.<c>`、操作日志动作 `op.<action>`、登录失败原因 `loginReason.<reason>`；文案放在 `src/locales/<语言代码>.ts`，每种语言一个文件（`zh-CN.ts` 是基准，其他文件键和占位符必须与它一致，测试会检查），用 `localesFromGlob(import.meta.glob('./locales/*.ts', { eager: true }))` 传给 `createPortalApp`，与壳的深合并。文案里不能出现 `@`、`|`、`$`，花括号只用于 `{占位符}`。接口错误说明的键放在 `err` 下（`err: { 'order.stockShort': '...' }`），与后端 `httpx.NewField` / `httpx.NewKey` 的键一致，键以模块名开头；后端的 `message` 写英文兜底。带点的键（如 `'system.user'`）和目录键（`system`）可以并存。
 - 显示字典值用 `<GaDictTag code="..." :value="..." />`，下拉用 `useDict(code).options`（只含启用的项）；不要在页面里另写一份"值 → 文字"的对照表。

@@ -19,6 +19,8 @@ export interface PortalContext {
   languages?: readonly LocaleCode[]
   /** 读上传头像的接口路径（相对端的接口前缀，D-040），默认 /system/avatars。 */
   avatarPath?: string
+  /** 主体端（代理商、商户，D-061）：登录要输入主体编号，壳挂上主体后台的内置页面（D-067）。 */
+  scoped?: boolean
 }
 
 let current: PortalContext | null = null
@@ -48,4 +50,9 @@ export function apiPrefix(portal: string): string {
 /** 读上传头像的接口路径（D-040）。端还没装配时用默认值。 */
 export function avatarPath(): string {
   return current?.avatarPath ?? '/system/avatars'
+}
+
+/** 当前端是不是主体端（D-067）。端还没装配时为 false。 */
+export function isScoped(): boolean {
+  return current?.scoped === true
 }

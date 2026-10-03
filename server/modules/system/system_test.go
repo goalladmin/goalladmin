@@ -30,7 +30,7 @@ func newApp(t *testing.T) *app.App {
 	p := cfg.Portals[conf.DefaultPortalCode]
 	p.JWTSecret = "platform-test-secret-0123456789abcdef0123456789"
 	cfg.Portals[conf.DefaultPortalCode] = p
-	a, err := app.New(cfg, app.WithDB(gdb), app.WithLogger(logx.New("error", "text", io.Discard)), app.WithBcryptCost(4))
+	a, err := app.New(cfg, app.WithDB(gdb), app.WithLogger(logx.New("error", "text", io.Discard)), app.WithPasswordHashParams(64, 1))
 	require.NoError(t, err)
 	a.Register(system.Module())
 	require.NoError(t, a.Setup())
@@ -50,14 +50,15 @@ func TestCreateAdminAndLogin(t *testing.T) {
 	_, err = system.CreateAdmin(ctx, a.Deps(), "ab")
 	require.Error(t, err)
 
-	// 库里：一个用户、一条 super 角色关系、密码是 bcrypt、必须改密
+	// 库里：一个用户、一条 super 角色关系、密码是 Argon2id 哈希（D-070）、必须改密
 	var u struct {
 		PasswordHash  string
 		MustChangePwd bool
 		Status        int
 	}
 	require.NoError(t, a.Deps().DB.Raw("SELECT password_hash, must_change_pwd, status FROM ga_user WHERE username = 'admin'").Scan(&u).Error)
-	require.True(t, strings.HasPrefix(u.PasswordHash, "$2a$"))
+	require.True(t, strings.HasPrefix(u.PasswordHash, "$argon2id$v=19$"), u.PasswordHash)
+	require.NotContains(t, u.PasswordHash, pwd)
 	require.True(t, u.MustChangePwd)
 	require.Equal(t, 1, u.Status)
 	var links int64

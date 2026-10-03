@@ -20,8 +20,9 @@ type Principal struct {
 	SessionID   string
 	Username    string
 	DisplayName string
-	Super       bool // 超级管理员，由角色决定
-	Locked      bool // 当前会话处于锁屏状态（D-027）；只有 /auth/me、/auth/unlock、/auth/logout 能走到这里
+	OrgID       uint64 // 所属主体（D-061）：只在主体端（portal.Portal.Scoped）非 0，来自会话行，不来自令牌和请求参数
+	Super       bool   // 平台端：超级管理员，由角色决定；主体端：本主体的主账号（主体的 owner_user_id）
+	Locked      bool   // 当前会话处于锁屏状态（D-027）；只有 /auth/me、/auth/unlock、/auth/logout 能走到这里
 }
 
 type ctxKey struct{}
@@ -73,7 +74,8 @@ type Service interface {
 	SessionOwner(ctx context.Context, portalCode, sid string) (uint64, error)
 	// ForgetAccount 让账号状态缓存立即失效（改了 status、must_change_pwd 之后调用）。
 	ForgetAccount(portal string, userID uint64)
-	// HashPassword 用该端的参数生成密码哈希（创建账号、重置密码时用）。
+	// HashPassword 用该端的参数生成密码哈希（创建账号、重置密码时用）。算哈希慢：先做完便宜的检查再调、在拿锁之前调。
+	// 和登录核对密码占同一个并发上限（D-068），满了返回 httpx.ErrTooManyRequests（429），不排队。
 	HashPassword(portal string, plain string) (string, error)
 	// ValidatePassword 按密码策略校验；不通过时返回带字段明细的 httpx 错误。
 	ValidatePassword(portal string, plain, username string) error
@@ -141,6 +143,7 @@ type ReasonCount struct {
 // LoginLogFilter 是登录日志的查询条件；零值字段不参与过滤。
 type LoginLogFilter struct {
 	Portal    string
+	OrgID     uint64 // 非 0 时只看这个主体的（主体端查本主体的日志，D-061）
 	UserID    uint64
 	Username  string // 前缀匹配
 	IP        string
@@ -153,6 +156,8 @@ type LoginLogFilter struct {
 type LoginLogInfo struct {
 	ID        uint64    `json:"id"`
 	Portal    string    `json:"portal"`
+	OrgID     uint64    `json:"orgId"`   // 主体端：编号对应的主体（D-061）
+	OrgCode   string    `json:"orgCode"` // 主体端：登录时输入的编号
 	Username  string    `json:"username"`
 	UserID    uint64    `json:"userId"`
 	SessionID string    `json:"sessionId"` // 登录成功时建立的会话（D-032）
@@ -168,6 +173,7 @@ type LoginLogInfo struct {
 type SessionInfo struct {
 	SID        string    `json:"sid"`
 	Portal     string    `json:"portal"`
+	OrgID      uint64    `json:"orgId"` // 主体端：会话所属的主体（D-061）
 	UserID     uint64    `json:"userId"`
 	IP         string    `json:"ip"`
 	UserAgent  string    `json:"userAgent"`

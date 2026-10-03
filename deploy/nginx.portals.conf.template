@@ -1,0 +1,51 @@
+# 官方 nginx 镜像启动时只替换 GA_*_HOST；$uri/$host 等变量保留给 nginx。
+resolver 127.0.0.11 valid=10s ipv6=off;
+upstream platform_backend {
+    zone platform_backend 64k;
+    server platform:8080 resolve;
+}
+upstream agent_backend {
+    zone agent_backend 64k;
+    server agent:8080 resolve;
+}
+upstream merchant_backend {
+    zone merchant_backend 64k;
+    server merchant:8080 resolve;
+}
+
+server {
+    listen 80 default_server;
+    server_name _;
+    server_tokens off;
+    return 404;
+}
+
+server {
+    listen 80;
+    server_name ${GA_PLATFORM_HOST};
+    root /usr/share/nginx/html/platform;
+    include /etc/nginx/snippets/portals-common.conf;
+    location /api/platform/ { proxy_pass http://platform_backend; }
+    location = /healthz { proxy_pass http://platform_backend; }
+    location = /readyz { proxy_pass http://platform_backend; }
+}
+
+server {
+    listen 80;
+    server_name ${GA_AGENT_HOST};
+    root /usr/share/nginx/html/agent;
+    include /etc/nginx/snippets/portals-common.conf;
+    location /api/agent/ { proxy_pass http://agent_backend; }
+    location = /healthz { proxy_pass http://agent_backend; }
+    location = /readyz { proxy_pass http://agent_backend; }
+}
+
+server {
+    listen 80;
+    server_name ${GA_MERCHANT_HOST};
+    root /usr/share/nginx/html/merchant;
+    include /etc/nginx/snippets/portals-common.conf;
+    location /api/merchant/ { proxy_pass http://merchant_backend; }
+    location = /healthz { proxy_pass http://merchant_backend; }
+    location = /readyz { proxy_pass http://merchant_backend; }
+}

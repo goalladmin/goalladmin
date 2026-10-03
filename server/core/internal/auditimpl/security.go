@@ -14,6 +14,7 @@ import (
 	"github.com/goalladmin/goalladmin/server/core/audit"
 	"github.com/goalladmin/goalladmin/server/core/auth"
 	"github.com/goalladmin/goalladmin/server/core/httpx"
+	"github.com/goalladmin/goalladmin/server/core/internal/ratelimit"
 	"github.com/goalladmin/goalladmin/server/core/internal/secmark"
 	"github.com/goalladmin/goalladmin/server/core/logx"
 )
@@ -22,10 +23,12 @@ import (
 
 // securityRow 对应 ga_security_event 的一行。
 type securityRow struct {
+	RouteKey    string    `gorm:"-"`
 	ID          uint64    `gorm:"column:id;primaryKey"`
 	DedupKey    string    `gorm:"column:dedup_key"`
 	WindowStart time.Time `gorm:"column:window_start"`
 	Portal      string    `gorm:"column:portal"`
+	OrgID       uint64    `gorm:"column:org_id"`
 	Kind        string    `gorm:"column:kind"`
 	Level       int       `gorm:"column:level"`
 	UserID      uint64    `gorm:"column:user_id"`
@@ -46,7 +49,7 @@ func (securityRow) TableName() string { return "ga_security_event" }
 
 func (e securityRow) public() audit.SecurityEvent {
 	return audit.SecurityEvent{
-		ID: e.ID, Portal: e.Portal, Kind: e.Kind, Level: e.Level, UserID: e.UserID, Username: e.Username, SessionID: e.SessionID,
+		ID: e.ID, Portal: e.Portal, OrgID: e.OrgID, Kind: e.Kind, Level: e.Level, UserID: e.UserID, Username: e.Username, SessionID: e.SessionID,
 		IP: e.IP, UserAgent: e.UserAgent, Method: e.Method, Path: e.Path, Detail: e.Detail, RequestID: e.RequestID,
 		Count: e.Count, FirstAt: e.FirstAt, LastAt: e.LastAt,
 	}
@@ -60,7 +63,7 @@ func levelOf(kind string) int {
 	case secmark.SessionRevoked:
 		return audit.LevelInfo
 	case secmark.Forbidden, secmark.CrossPortal, secmark.TokenInvalid, secmark.RefreshMismatch, secmark.BadOrigin,
-		secmark.LoginLocked, secmark.LoginRateLimited, secmark.UnlockExhausted, secmark.PwdChangeThrottled, secmark.RefreshCookieDup, secmark.CLI:
+		secmark.LoginLocked, secmark.LoginRateLimited, secmark.UnlockExhausted, secmark.PwdChangeThrottled, secmark.RefreshCookieDup, secmark.CLI, secmark.IPDenied:
 		return audit.LevelWarning
 	}
 	return 0
@@ -72,7 +75,8 @@ var kindRe = regexp.MustCompile(`^[a-z][a-z0-9_.]{0,31}$`)
 func (r *Recorder) recordSecurity(c *gin.Context, m secmark.Mark) {
 	ctx := c.Request.Context()
 	ev := securityRow{
-		Kind: m.Kind, Level: levelOf(m.Kind), UserID: m.UserID, Username: m.Username, SessionID: m.SessionID,
+		RouteKey: c.FullPath(),
+		Kind:     m.Kind, Level: levelOf(m.Kind), OrgID: m.OrgID, UserID: m.UserID, Username: m.Username, SessionID: m.SessionID,
 		IP: c.ClientIP(), UserAgent: c.Request.UserAgent(), Method: c.Request.Method, Path: c.FullPath(), Detail: m.Detail,
 		Portal: portalOf(c.Request.URL.Path),
 	}
@@ -83,6 +87,9 @@ func (r *Recorder) recordSecurity(c *gin.Context, m secmark.Mark) {
 		ev.Portal = p.Portal
 		if ev.UserID == 0 {
 			ev.UserID, ev.SessionID = p.UserID, p.SessionID
+		}
+		if ev.OrgID == 0 && ev.UserID == p.UserID {
+			ev.OrgID = p.OrgID
 		}
 		if ev.Username == "" && ev.UserID == p.UserID {
 			ev.Username = p.Username
@@ -117,7 +124,7 @@ func (r *Recorder) RecordSecurity(ctx context.Context, e audit.NewSecurityEvent)
 		}
 	}
 	r.addSecurity(ctx, securityRow{
-		Portal: e.Portal, Kind: e.Kind, Level: level, UserID: e.UserID, Username: e.Username, SessionID: e.SessionID,
+		Portal: e.Portal, OrgID: e.OrgID, Kind: e.Kind, Level: level, UserID: e.UserID, Username: e.Username, SessionID: e.SessionID,
 		IP: e.IP, Detail: e.Detail,
 	})
 	return nil
@@ -125,6 +132,9 @@ func (r *Recorder) RecordSecurity(ctx context.Context, e audit.NewSecurityEvent)
 
 // addSecurity 补齐时间、截断各列，写一行审计记录到日志输出，再交给 throttle 合并写库。
 func (r *Recorder) addSecurity(ctx context.Context, ev securityRow) {
+	if r.knownPortal != nil && !r.knownPortal(ev.Portal) {
+		ev.Portal = ""
+	}
 	now := r.now().UTC()
 	ev.Portal, ev.Username, ev.SessionID = truncate(ev.Portal, 32), truncate(ev.Username, 64), truncate(ev.SessionID, 32)
 	ev.IP, ev.UserAgent, ev.Method = truncate(ev.IP, 64), truncate(ev.UserAgent, 255), truncate(ev.Method, 10)
@@ -137,23 +147,41 @@ func (r *Recorder) addSecurity(ctx context.Context, ev securityRow) {
 	if strings.HasPrefix(ev.Kind, "login_") {
 		keyUser = ""
 	}
-	ev.DedupKey = fingerprint(ev.Portal, ev.Kind, strconv.FormatUint(ev.UserID, 10), keyUser, ev.SessionID, ev.IP, ev.Method, ev.Path, ev.Detail)
-	logx.Audit(ctx, "audit.security", "kind", ev.Kind, "level", ev.Level, "portal", ev.Portal, "user_id", ev.UserID, "username", ev.Username,
+	keyPath := ev.RouteKey
+	if keyPath == "" {
+		keyPath = "(unmatched)"
+	}
+	keyMethod := ev.Method
+	switch keyMethod {
+	case "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT":
+	default:
+		keyMethod = "OTHER"
+	}
+	parts := []string{ev.Portal, ev.Kind, strconv.FormatUint(ev.UserID, 10), keyUser, ev.SessionID, ratelimit.IPKey(ev.IP), keyMethod, keyPath, ev.Detail}
+	if ev.OrgID != 0 {
+		parts = append(parts, "org:"+strconv.FormatUint(ev.OrgID, 10))
+	}
+	ev.DedupKey = fingerprint(parts...)
+	logx.Audit(ctx, "audit.security", "kind", ev.Kind, "level", ev.Level, "portal", ev.Portal, "org_id", ev.OrgID, "user_id", ev.UserID, "username", ev.Username,
 		"session_id", ev.SessionID, "ip", ev.IP, "method", ev.Method, "path", ev.Path, "detail", ev.Detail)
 	if r.db == nil {
 		return
 	}
 	// 严重事件不受新来源写入速度的限制：攻击者刷别的事件也挤不掉它们
-	r.security.Add(ctx, ev.DedupKey+"|"+ev.WindowStart.Format(time.RFC3339), ev, ev.Level >= audit.LevelCritical)
+	queue := r.security
+	if p, ok := auth.FromCtx(ctx); ok && p.UserID != 0 {
+		queue = r.authSecurity
+	}
+	queue.Add(ctx, ev.DedupKey+"|"+ev.WindowStart.Format(time.RFC3339), ev, ev.Level >= audit.LevelCritical)
 }
 
 // upsertSecurity 插入这一分钟的第一行，或给已有的行累加次数。
 func (r *Recorder) upsertSecurity(ctx context.Context, e securityRow, n int64) error {
 	return r.db.WithContext(ctx).Exec(`INSERT INTO ga_security_event
-		(dedup_key, window_start, portal, kind, level, user_id, username, session_id, ip, user_agent, method, path, detail, request_id, count, first_at, last_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		(dedup_key, window_start, portal, org_id, kind, level, user_id, username, session_id, ip, user_agent, method, path, detail, request_id, count, first_at, last_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON DUPLICATE KEY UPDATE count = count + VALUES(count), last_at = GREATEST(last_at, VALUES(last_at))`,
-		e.DedupKey, e.WindowStart, e.Portal, e.Kind, e.Level, e.UserID, e.Username, e.SessionID, e.IP, e.UserAgent, e.Method, e.Path,
+		e.DedupKey, e.WindowStart, e.Portal, e.OrgID, e.Kind, e.Level, e.UserID, e.Username, e.SessionID, e.IP, e.UserAgent, e.Method, e.Path,
 		e.Detail, e.RequestID, n, e.FirstAt, e.LastAt).Error
 }
 
@@ -168,6 +196,9 @@ func (r *Recorder) ListSecurityEvents(ctx context.Context, f audit.SecurityFilte
 		q = q.Where("portal IN (?, '')", f.Portal)
 	case f.Portal != "":
 		q = q.Where("portal = ?", f.Portal)
+	}
+	if f.OrgID != 0 {
+		q = q.Where("org_id = ?", f.OrgID)
 	}
 	if f.Kind != "" {
 		q = q.Where("kind = ?", f.Kind)

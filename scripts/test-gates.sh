@@ -38,4 +38,5 @@ printf '(\n' >"$tmp/bad-words.txt" # 写错的正则：grep 出错（退出码 2
 expect_fail banned-words env BANNED_WORDS_FILE="$tmp/bad-words.txt" bash scripts/banned-words.sh
 
 [ "$fail" -eq 0 ] || { echo "test-gates: FAILED"; exit 1; }
+sh scripts/test-portal-hosts.sh
 echo "test-gates: OK"

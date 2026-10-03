@@ -388,3 +388,26 @@ func TestMigrate_UsesDedicatedPoolWhenAppOpensDB(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, cfg.Database.MaxOpenConns, sqlDB.Stats().MaxOpenConnections, "主连接池不是迁移用的那个")
 }
+
+// 182（D-098）：debug 模式监听非回环地址时，启动时有一条 WARN；只听本机时没有。
+func TestRun_182_DebugOnNonLoopbackWarns(t *testing.T) {
+	run := func(addr string) string {
+		cfg := conf.Default()
+		cfg.Server.Addr = addr
+		var buf bytes.Buffer
+		a, err := app.New(cfg, app.WithDB(nil), app.WithLogger(logx.New("warn", "text", &buf)))
+		require.NoError(t, err)
+		require.NoError(t, a.Setup())
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() { done <- a.Run(ctx) }()
+		cancel() // 告警在开始监听之前就打了；输出在 Run 返回之后才读
+		require.NoError(t, <-done)
+		return buf.String()
+	}
+	out := run("0.0.0.0:0")
+	require.Contains(t, out, "level=WARN")
+	require.Contains(t, out, "debug mode is listening on a non-loopback address")
+	require.Contains(t, out, "GA_SERVER_MODE=release")
+	require.NotContains(t, run("127.0.0.1:0"), "non-loopback")
+}

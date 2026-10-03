@@ -134,6 +134,22 @@ kbd {
   padding: var(--ga-gap);
 }
 
+/* 页脚的版权说明（D-119）：布局里占内容区下面的一行，登录等页面里在舞台底部沿用那里的字色 */
+.ga-footer {
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: center;
+  /* 窄屏放不下一行时在空格处换行，不把一个词拆开，两行尽量一样长 */
+  word-break: keep-all;
+  text-wrap: balance;
+}
+
+.ga-layout__footer {
+  flex: 0 0 auto;
+  padding: 0 var(--ga-gap) 8px;
+  color: var(--ga-text-secondary);
+}
+
 .ga-layout.is-compact {
   --ga-gap: 10px;
   --ga-topbar-height: 48px;
@@ -383,6 +399,20 @@ kbd {
 
 .ga-topbar__user:hover {
   background: var(--ga-hover);
+}
+
+/* 主体端顶栏上的主体名称（D-067） */
+.ga-topbar__org {
+  max-width: 220px;
+  margin-left: 8px;
+  padding: 2px 10px;
+  overflow: hidden;
+  border: 1px solid var(--ga-border);
+  border-radius: 999px;
+  color: var(--ga-text-secondary);
+  font-size: 13px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .ga-breadcrumb {
@@ -846,8 +876,10 @@ kbd {
   display: flex;
   align-items: center;
   justify-content: center;
+  /* 内边距算在高度里：舞台正好一屏高，底部的说明不会落到屏幕外面；上下留出底部说明的位置，卡片再高也不会和它叠在一起（D-119） */
+  box-sizing: border-box;
   min-height: 100vh;
-  padding: 24px;
+  padding: 72px 24px;
   overflow: hidden;
   color: #e6edf7;
   background:
@@ -1124,6 +1156,7 @@ kbd {
   bottom: 18px;
   left: 0;
   right: 0;
+  padding: 0 16px;
   text-align: center;
   font-size: 12px;
   color: rgba(230, 237, 247, 0.42);
@@ -1171,7 +1204,7 @@ kbd {
 
 @media (max-width: 480px) {
   .ga-auth {
-    padding: 16px;
+    padding: 72px 16px;
   }
 
   .ga-auth__card {

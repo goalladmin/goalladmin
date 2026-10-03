@@ -102,6 +102,16 @@ func (r *UserRepo) UpdatePasswordHash(ctx context.Context, id uint64, hash strin
 	return nil
 }
 
+// RehashPassword 把密码哈希从 oldHash 换成 newHash，只动这一列（portal.PasswordRehasher，D-070）：登录时把旧算法的哈希
+// 升级成当前的，密码没变，所以"必须改密"、改密时间、更新时间都不动。哈希已经不是 oldHash 时什么都不做。
+func (r *UserRepo) RehashPassword(ctx context.Context, id uint64, oldHash, newHash string) error {
+	err := db.From(ctx).Model(&User{}).Where("id = ? AND password_hash = ?", id, oldHash).UpdateColumn("password_hash", newHash).Error
+	if err != nil {
+		return fmt.Errorf("system: rehash password: %w", err)
+	}
+	return nil
+}
+
 // TouchLogin 记录最后登录时间和 IP。
 func (r *UserRepo) TouchLogin(ctx context.Context, id uint64, ip string, at time.Time) error {
 	return db.From(ctx).Model(&User{}).Where("id = ?", id).Updates(map[string]any{
@@ -122,7 +132,7 @@ func (r *UserRepo) List(ctx context.Context, q httpx.PageQuery, status *int, dep
 	tx := scope.Apply(db.From(ctx).Model(&User{}), userDeptCol, userOwnerCol)
 	if q.Keyword != "" {
 		like := "%" + escapeLike(q.Keyword) + "%"
-		tx = tx.Where("username LIKE ? OR display_name LIKE ? OR email LIKE ?", like, like, like)
+		tx = tx.Where("(username LIKE ? OR display_name LIKE ? OR email LIKE ?)", like, like, like)
 	}
 	if status != nil {
 		tx = tx.Where("status = ?", *status)
@@ -241,6 +251,10 @@ func (p *userProvider) LockByID(ctx context.Context, id uint64) (*portal.Account
 
 func (p *userProvider) UpdatePasswordHash(ctx context.Context, id uint64, hash string, mustChange bool) error {
 	return p.repo.UpdatePasswordHash(ctx, id, hash, mustChange)
+}
+
+func (p *userProvider) RehashPassword(ctx context.Context, id uint64, oldHash, newHash string) error {
+	return p.repo.RehashPassword(ctx, id, oldHash, newHash)
 }
 
 func (p *userProvider) TouchLogin(ctx context.Context, id uint64, ip string, at time.Time) error {

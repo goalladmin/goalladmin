@@ -12,7 +12,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"regexp"
-	"slices"
 	"time"
 
 	"gorm.io/gorm"
@@ -20,17 +19,13 @@ import (
 	"github.com/goalladmin/goalladmin/server/core/auth"
 	"github.com/goalladmin/goalladmin/server/core/db"
 	"github.com/goalladmin/goalladmin/server/core/httpx"
+	"github.com/goalladmin/goalladmin/server/core/portal"
 )
 
-// avatarPresets 是内置头像的名字，和壳里的 AVATAR_PRESETS（web/packages/shell/src/avatar.ts）是同一份表，由测试对齐。
-var avatarPresets = []string{
-	"aurora", "ocean", "forest", "sunset", "berry", "slate",
-	"sand", "mint", "coral", "violet", "sky", "amber",
-}
-
-// ga_user.avatar 的前缀。
+// ga_user.avatar 的前缀。内置头像的名字表在内核里（portal.AvatarPresets，主体端也用），和壳里的 AVATAR_PRESETS
+// （web/packages/shell/src/avatar.ts）是同一份表，由测试对齐。
 const (
-	avatarPresetPrefix = "preset:"
+	avatarPresetPrefix = portal.AvatarPresetPrefix
 	avatarUploadPrefix = "upload:"
 )
 
@@ -81,13 +76,11 @@ func newAvatarKey() (string, error) {
 
 // UploadAvatar 本人上传头像：服务器重新生成图片后存下，返回新的 avatar 值。
 func (s *UserService) UploadAvatar(ctx context.Context, p auth.Principal, raw []byte) (string, error) {
-	// 解码和缩放要内存和 CPU：整个进程同时最多处理 avatarSlots 个，其余的排队，等到请求时限就放弃
-	select {
-	case s.avatarSlots <- struct{}{}:
-		defer func() { <-s.avatarSlots }()
-	case <-ctx.Done():
-		return "", ctx.Err()
+	_, release, err := s.admitAvatar(ctx, p.UserID)
+	if err != nil {
+		return "", err
 	}
+	defer release()
 	big, thumb, err := processAvatar(raw)
 	if err != nil {
 		return "", err
@@ -104,6 +97,38 @@ func (s *UserService) UploadAvatar(ctx context.Context, p auth.Principal, raw []
 	return value, nil
 }
 
+type avatarAdmissionKey struct {
+	service *UserService
+	userID  uint64
+}
+
+func (s *UserService) admitAvatar(ctx context.Context, userID uint64) (context.Context, func(), error) {
+	key := avatarAdmissionKey{s, userID}
+	if held, _ := ctx.Value(key).(bool); held {
+		return ctx, func() {}, nil
+	}
+	select {
+	case s.avatarSlots <- struct{}{}:
+	default:
+		return ctx, nil, httpx.ErrTooManyRequests
+	}
+	s.avatarMu.Lock()
+	if s.avatarUsers[userID] {
+		s.avatarMu.Unlock()
+		<-s.avatarSlots
+		return ctx, nil, httpx.ErrTooManyRequests
+	}
+	s.avatarUsers[userID] = true
+	s.avatarMu.Unlock()
+	release := func() {
+		s.avatarMu.Lock()
+		delete(s.avatarUsers, userID)
+		s.avatarMu.Unlock()
+		<-s.avatarSlots
+	}
+	return context.WithValue(ctx, key, true), release, nil
+}
+
 // setOwnAvatar 在锁里重新认定本人之后改头像（D-048）：请求途中账号被停用、会话被吊销的，这次修改作废（401）。
 // 只锁本人的账号行，不拿全端的超管锁（D-058）。
 func (s *UserService) setOwnAvatar(ctx context.Context, p auth.Principal, value string, row *userAvatar) error {
@@ -114,7 +139,7 @@ func (s *UserService) setOwnAvatar(ctx context.Context, p auth.Principal, value 
 
 // SetPresetAvatar 本人选一个内置头像。
 func (s *UserService) SetPresetAvatar(ctx context.Context, p auth.Principal, name string) (string, error) {
-	if !slices.Contains(avatarPresets, name) {
+	if !portal.ValidAvatarPreset(name) {
 		return "", httpx.ErrValidation.WithFields(httpx.NewField("preset", "system.avatar.preset", "unknown built-in avatar"))
 	}
 	value := avatarPresetPrefix + name
@@ -167,4 +192,4 @@ func (s *UserService) AvatarImage(ctx context.Context, key string, thumb bool) (
 }
 
 // AvatarPresets 返回内置头像的名字（副本）。
-func AvatarPresets() []string { return slices.Clone(avatarPresets) }
+func AvatarPresets() []string { return portal.AvatarPresets() }

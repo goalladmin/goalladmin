@@ -21,6 +21,7 @@ import (
 	"github.com/goalladmin/goalladmin/server/core/httpx"
 	"github.com/goalladmin/goalladmin/server/core/internal/middleware"
 	"github.com/goalladmin/goalladmin/server/core/internal/secmark"
+	"github.com/goalladmin/goalladmin/server/core/logx"
 )
 
 // 合并与限速的参数（D-032）。
@@ -33,20 +34,23 @@ const (
 
 // Options 是创建 Recorder 的参数。
 type Options struct {
-	DB   *gorm.DB // 为 nil 时什么都不写（没有数据库的测试）
-	Log  *slog.Logger
-	Now  func() time.Time
-	Skip []string // 不记录的路由模板（健康检查）
+	DB          *gorm.DB // 为 nil 时什么都不写（没有数据库的测试）
+	Log         *slog.Logger
+	Now         func() time.Time
+	Skip        []string          // 不记录的路由模板（健康检查）
+	KnownPortal func(string) bool // 可选注册表检查，应用装配必须提供。
 }
 
 // Recorder 记录并查询审计数据，实现 audit.Service。
 type Recorder struct {
-	db       *gorm.DB
-	log      *slog.Logger
-	now      func() time.Time
-	skip     map[string]bool
-	errors   *throttle[errorRow]
-	security *throttle[securityRow]
+	db           *gorm.DB
+	log          *slog.Logger
+	now          func() time.Time
+	skip         map[string]bool
+	errors       *throttle[errorRow]
+	security     *throttle[securityRow]
+	authSecurity *throttle[securityRow]
+	knownPortal  func(string) bool
 
 	stop   chan struct{} // 后台定时写库；Start 之后非空
 	done   chan struct{}
@@ -61,13 +65,15 @@ func New(o Options) *Recorder {
 	if o.Now == nil {
 		o.Now = time.Now
 	}
-	r := &Recorder{db: o.DB, log: o.Log.With("component", "audit"), now: o.Now, skip: map[string]bool{}}
+	r := &Recorder{db: o.DB, log: o.Log.With("component", "audit"), now: o.Now, skip: map[string]bool{}, knownPortal: o.KnownPortal}
 	for _, p := range o.Skip {
 		r.skip[p] = true
 	}
 	r.errors = newThrottle("error log", o.Now, r.log, flushInterval, maxKeys, newKeysPerSec, newKeysBurst, r.upsertError)
 	r.security = newThrottle("security event", o.Now, r.log, flushInterval, maxKeys, newKeysPerSec, newKeysBurst, r.upsertSecurity)
+	r.authSecurity = newThrottle("authenticated security event", o.Now, r.log, flushInterval, maxKeys, newKeysPerSec, newKeysBurst, r.upsertSecurity)
 	r.errors.permanent, r.security.permanent = db.IsDataError, db.IsDataError
+	r.authSecurity.permanent = db.IsDataError
 	return r
 }
 
@@ -90,6 +96,7 @@ func (r *Recorder) Start() {
 			case <-tk.C:
 				r.errors.FlushDue(ctx)
 				r.security.FlushDue(ctx)
+				r.authSecurity.FlushDue(ctx)
 			}
 		}
 	}(r.stop, r.done)
@@ -113,6 +120,7 @@ func (r *Recorder) Flush(ctx context.Context) {
 	}
 	r.errors.Flush(ctx)
 	r.security.Flush(ctx)
+	r.authSecurity.Flush(ctx)
 }
 
 // Middleware 在请求结束后记录审计数据。必须排在 Recovery 之前（外层），这样能看到 panic 转成的 500。
@@ -211,11 +219,11 @@ func errorText(c *gin.Context, code int) string {
 	v, _ := c.Get(httpx.KeyResponseErr)
 	if err, ok := v.(error); ok && err != nil {
 		if cause := errors.Unwrap(httpx.AsError(err)); cause != nil {
-			return cause.Error()
+			return logx.ErrorText(cause)
 		}
 		var he *httpx.Error
 		if !errors.As(err, &he) {
-			return err.Error()
+			return logx.ErrorText(err)
 		}
 	}
 	if code == 0 {

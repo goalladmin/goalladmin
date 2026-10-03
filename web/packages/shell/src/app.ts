@@ -1,6 +1,6 @@
 // createPortalApp：一个端的全部装配。各端的 main.ts 只需要一行。
 
-import { createApp, h } from 'vue'
+import { createApp, defineAsyncComponent, h } from 'vue'
 import type { App as VueApp, Component } from 'vue'
 import type { RouteRecordRaw } from 'vue-router'
 import { createPinia } from 'pinia'
@@ -20,7 +20,7 @@ import GaNotFound from './views/GaNotFound.vue'
 import GaDictTag from './dict/GaDictTag.vue'
 import { useAuthStore } from './auth/store'
 import { apiPrefix, setPortalContext } from './context'
-import { AllLocaleCodes, createPortalI18n } from './i18n'
+import { AllLocaleCodes, createPortalI18n, scopedMessages } from './i18n'
 import type { LocaleCode, LocaleMessages } from './i18n'
 import { formatApiError } from './request/errors'
 import { GaPerm, vPerm } from './perm'
@@ -57,12 +57,31 @@ export interface PortalAppOptions {
   build?: string
   /** 读上传头像的接口路径（相对端的接口前缀，D-040），默认 /system/avatars。 */
   avatarPath?: string
+  /**
+   * 主体端（代理商、商户，D-061、D-067）：登录页多一个主体编号，顶栏显示主体名称；壳挂上主体后台的内置页面
+   * （菜单组件名 org/<页面>/index，应用 views 里同名的优先），个人中心默认用主体端的。
+   */
+  scoped?: boolean
+}
+
+/** 主体端的内置页面：键是后端菜单声明的组件名（core/orgportal 的 Menus）。 */
+const orgViews: ViewGlob = {
+  'org/dashboard/index': () => import('./views/org/GaOrgDashboard.vue'),
+  'org/ip-allow/index': () => import('./views/org/GaOrgIPAllow.vue'),
+  'org/ip-deny/index': () => import('./views/org/GaOrgIPDeny.vue'),
+  'org/overview/index': () => import('./views/org/GaOrgOverview.vue'),
+  'org/accounts/index': () => import('./views/org/GaOrgAccounts.vue'),
+  'org/roles/index': () => import('./views/org/GaOrgRoles.vue'),
+  'org/sessions/index': () => import('./views/org/GaOrgSessions.vue'),
+  'org/loginlog/index': () => import('./views/org/GaOrgLoginLogs.vue'),
+  'org/oplog/index': () => import('./views/org/GaOrgOperationLogs.vue'),
 }
 
 export function createPortalApp(opts: PortalAppOptions): VueApp {
   const pinia = createPinia()
   const languages = opts.languages?.length ? opts.languages : [...AllLocaleCodes]
-  const i18n = createPortalI18n(opts.locales, languages)
+  const scoped = opts.scoped === true
+  const i18n = createPortalI18n(scoped ? [scopedMessages(), opts.locales ?? {}] : opts.locales, languages)
   const t = (key: string) => i18n.global.t(key)
   const tp = (key: string, params?: Record<string, unknown>) => i18n.global.t(key, params ?? {})
   const te = (key: string) => i18n.global.te(key) || i18n.global.te(key, 'en-US')
@@ -102,19 +121,21 @@ export function createPortalApp(opts: PortalAppOptions): VueApp {
   const pages = {
     login: opts.pages?.login ?? GaLogin,
     changePassword: opts.pages?.changePassword ?? GaChangePassword,
-    profile: opts.pages?.profile ?? GaProfile,
+    // 主体端的个人中心按需加载：平台端的包里不带它
+    profile: opts.pages?.profile ?? (scoped ? defineAsyncComponent(() => import('./views/org/GaOrgProfile.vue')) : GaProfile),
     forbidden: opts.pages?.forbidden ?? GaForbidden,
     notFound: opts.pages?.notFound ?? GaNotFound,
   }
   const portalRouter = createPortalRouter({
-    views: opts.views,
+    // 应用自己的视图排在后面：同一个组件名时覆盖内置的（normalizeViews 按顺序写入）
+    views: scoped ? { ...orgViews, ...opts.views } : opts.views,
     layout: opts.pages?.layout ?? GaLayout,
     pages,
-    extraRoutes: opts.routes,
+    extraRoutes: [...(scoped ? [{ path: '/register', component: () => import('./views/GaRegister.vue'), meta: { public: true, titleKey: 'onboarding.title' } }] : []), ...(opts.routes ?? [])],
     base: opts.base,
   })
 
-  setPortalContext({ portal: opts.portal, client, router: portalRouter.router, installMenuRoutes: portalRouter.installMenuRoutes, languages, avatarPath: opts.avatarPath })
+  setPortalContext({ portal: opts.portal, client, router: portalRouter.router, installMenuRoutes: portalRouter.installMenuRoutes, languages, avatarPath: opts.avatarPath, scoped })
 
   const app = createApp(GaRoot)
   app.use(pinia)

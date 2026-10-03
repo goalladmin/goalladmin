@@ -39,7 +39,7 @@ func newRouteFixture(t *testing.T) *fixture {
 	p.JWTSecret = "platform-test-secret-0123456789abcdef0123456789"
 	p.Login.IPRatePerMinute = 600
 	cfg.Portals[conf.DefaultPortalCode] = p
-	a, err := app.New(cfg, app.WithDB(gdb), app.WithLogger(logx.New("error", "text", io.Discard)), app.WithBcryptCost(4))
+	a, err := app.New(cfg, app.WithDB(gdb), app.WithLogger(logx.New("error", "text", io.Discard)), app.WithPasswordHashParams(64, 1))
 	require.NoError(t, err)
 	a.Register(system.Module(), &menuModule{menus: demoMenus()})
 	require.NoError(t, a.Setup())
@@ -64,8 +64,8 @@ func (f *fixture) send(tok string, c routeCase) resp {
 
 // routeTargets 是用例要用到的现成数据，由 root 在测试开始时建好。
 type routeTargets struct {
-	dave, dept, post, role, dict, item uint64
-	daveSID, group                     string
+	dave, dept, post, role, dict, item, deny uint64
+	daveSID, group                           string
 }
 
 func (f *fixture) routeTargets(root string) routeTargets {
@@ -85,6 +85,9 @@ func (f *fixture) routeTargets(root string) routeTargets {
 	r = f.do(root, "POST", "/system/menu-groups", gin.H{"titles": gin.H{"zh-CN": "常用"}})
 	require.Equal(f.t, 0, r.env.Code, r.rec.Body.String())
 	t.group = r.data()["name"].(string)
+	r = f.do(root, "POST", "/system/ip-rules/deny", gin.H{"cidr": "192.0.2.55"})
+	require.Equal(f.t, 0, r.env.Code, r.rec.Body.String())
+	t.deny = uint64(r.data()["id"].(float64))
 	return t
 }
 
@@ -122,6 +125,11 @@ func (f *fixture) routeCases(root string, t routeTargets) []routeCase {
 		{"POST", "/system/menus/:name/reset", "/system/menus/demo-a/reset", nil, nil, ""},
 		{"POST", "/system/menu-groups", "/system/menu-groups", gin.H{"titles": gin.H{"zh-CN": "新分组"}}, nil, ""},
 		{"DELETE", "/system/menu-groups/:name", "/system/menu-groups/" + t.group, nil, nil, ""},
+		// IP 访问控制（D-062）
+		{"POST", "/system/ip-rules/deny", "/system/ip-rules/deny", gin.H{"cidr": "198.51.100.77", "expiresIn": 60}, nil, ""},
+		{"DELETE", "/system/ip-rules/deny/:id", "/system/ip-rules/deny/" + fmt.Sprint(t.deny), nil, nil, ""},
+		{"PUT", "/system/ip-rules/allow", "/system/ip-rules/allow", gin.H{"items": []gin.H{{"cidr": "203.0.113.0/24"}}}, nil, ""},
+		{"PUT", "/system/users/:id/ip-allow", "/system/users/" + u + "/ip-allow", gin.H{"items": []gin.H{{"cidr": "203.0.113.0/24"}}}, nil, ""},
 		// 只需登录的本人写操作（D-048）
 		{"PUT", "/system/profile", "/system/profile", gin.H{"displayName": "改名", "email": "x@example.com"}, nil, ""},
 		{"POST", "/system/profile/revoke-other-sessions", "/system/profile/revoke-other-sessions", nil, nil, ""},

@@ -1,4 +1,4 @@
-// Vite 插件：生成 third-party-licenses.txt（D-027）。
+// Vite 插件：生成 third-party-licenses.txt（D-027；三个端共用，D-067；纯 JS，构建时由 Node 直接加载）。
 //
 // 收录实际打进产物的每个第三方包（按打包结果里的模块路径找到所在的包），附上它的 LICENSE / NOTICE 原文。
 // MIT、Apache-2.0 等许可证要求分发时附带版权和许可声明；页面上不需要显示署名，放在部署目录里即可。
@@ -8,17 +8,14 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, join, sep } from 'node:path'
 
-import type { Plugin } from 'vite'
+/** @typedef {{ name: string, version: string, license: string, dir: string }} Pkg */
 
-interface Pkg {
-  name: string
-  version: string
-  license: string
-  dir: string
-}
-
-/** 从模块路径找出它所在的包目录（取最后一个 node_modules 之后的一段，带作用域的取两段）。 */
-export function packageDirOf(id: string): string | null {
+/**
+ * 从模块路径找出它所在的包目录（取最后一个 node_modules 之后的一段，带作用域的取两段）。
+ * @param {string} id
+ * @returns {string | null}
+ */
+export function packageDirOf(id) {
   const marker = `${sep}node_modules${sep}`
   const i = id.lastIndexOf(marker)
   if (i < 0) return null
@@ -29,26 +26,36 @@ export function packageDirOf(id: string): string | null {
 }
 
 /** 打包工具注入的虚拟模块（不在 node_modules 里）属于哪个包。 */
-const VIRTUAL: [RegExp, string][] = [
+/** @type {[RegExp, string][]} */
+const VIRTUAL = [
   [/^\0plugin-vue/, '@vitejs/plugin-vue'],
   [/^\0vite\//, 'vite'],
 ]
 
-/** 读包目录的 package.json。读不了、没有名字都直接报错（D-055）：已经打包进产物的包不能因为读不出来就从清单里漏掉。 */
-function readPkg(dir: string): Pkg {
-  let p: { name?: string; version?: string; license?: unknown }
+/**
+ * 读包目录的 package.json。读不了、没有名字都直接报错（D-055）：已经打包进产物的包不能因为读不出来就从清单里漏掉。
+ * @param {string} dir
+ * @returns {Pkg}
+ */
+function readPkg(dir) {
+  /** @type {{ name?: string, version?: string, license?: unknown }} */
+  let p
   try {
-    p = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as typeof p
+    p = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'))
   } catch (e) {
-    throw new Error(`cannot read ${join(dir, 'package.json')}: ${(e as Error).message}`, { cause: e })
+    throw new Error(`cannot read ${join(dir, 'package.json')}: ${/** @type {Error} */ (e).message}`, { cause: e })
   }
   if (!p.name) throw new Error(`${join(dir, 'package.json')} has no name`)
   const license = typeof p.license === 'string' ? p.license : 'UNKNOWN'
   return { name: p.name, version: p.version ?? '', license, dir }
 }
 
-/** 包目录里的许可证类文件：LICENSE、LICENCE、COPYING、UNLICENSE、NOTICE（不区分大小写，可带扩展名），NOTICE 排在后面。 */
-function noticeFiles(dir: string): string[] {
+/**
+ * 包目录里的许可证类文件：LICENSE、LICENCE、COPYING、UNLICENSE、NOTICE（不区分大小写，可带扩展名），NOTICE 排在后面。
+ * @param {string} dir
+ * @returns {string[]}
+ */
+function noticeFiles(dir) {
   try {
     return readdirSync(dir)
       .filter((f) => /^(licen[cs]e|copying|unlicense|notice)(\.|-|$)/i.test(f))
@@ -58,19 +65,28 @@ function noticeFiles(dir: string): string[] {
   }
 }
 
-/** 是否带许可证正文：只有 NOTICE 不算（D-055）。 */
-function hasLicense(dir: string): boolean {
+/**
+ * 是否带许可证正文：只有 NOTICE 不算（D-055）。
+ * @param {string} dir
+ */
+function hasLicense(dir) {
   return noticeFiles(dir).some((f) => !/^notice/i.test(f))
 }
 
-export function thirdPartyLicenses(opts: { fileName?: string; root?: string } = {}): Plugin {
+/**
+ * 生成第三方许可证清单的 Vite 插件。
+ * @param {{ fileName?: string, root?: string }} [opts]
+ * @returns {import('vite').Plugin}
+ */
+export function thirdPartyLicenses(opts = {}) {
   const fileName = opts.fileName ?? 'third-party-licenses.txt'
   return {
     name: 'ga-third-party-licenses',
     apply: 'build',
     generateBundle(_options, bundle) {
       const req = createRequire(join(opts.root ?? process.cwd(), 'package.json'))
-      const dirs = new Set<string>()
+      /** @type {Set<string>} */
+      const dirs = new Set()
       for (const out of Object.values(bundle)) {
         if (out.type !== 'chunk') continue
         for (const id of Object.keys(out.modules)) {
@@ -89,13 +105,15 @@ export function thirdPartyLicenses(opts: { fileName?: string; root?: string } = 
           }
         }
       }
-      const pkgs = new Map<string, Pkg>()
+      /** @type {Map<string, Pkg>} */
+      const pkgs = new Map()
       for (const dir of dirs) {
-        let p: Pkg
+        /** @type {Pkg} */
+        let p
         try {
           p = readPkg(dir)
         } catch (e) {
-          this.error((e as Error).message)
+          this.error(/** @type {Error} */ (e).message)
         }
         if (!p.name.startsWith('@ga/')) pkgs.set(`${p.name}@${p.version}`, p)
       }

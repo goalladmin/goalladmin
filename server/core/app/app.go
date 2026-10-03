@@ -4,6 +4,7 @@
 package app
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -30,9 +32,14 @@ import (
 	"github.com/goalladmin/goalladmin/server/core/internal/captcha"
 	"github.com/goalladmin/goalladmin/server/core/internal/metrics"
 	"github.com/goalladmin/goalladmin/server/core/internal/middleware"
+	"github.com/goalladmin/goalladmin/server/core/internal/password"
+	"github.com/goalladmin/goalladmin/server/core/internal/ratelimit"
+	"github.com/goalladmin/goalladmin/server/core/internal/redisx"
 	"github.com/goalladmin/goalladmin/server/core/internal/session"
+	"github.com/goalladmin/goalladmin/server/core/ipacl"
 	"github.com/goalladmin/goalladmin/server/core/logx"
 	"github.com/goalladmin/goalladmin/server/core/monitor"
+	"github.com/goalladmin/goalladmin/server/core/org"
 	"github.com/goalladmin/goalladmin/server/core/portal"
 	"github.com/goalladmin/goalladmin/server/core/rbac"
 	"github.com/goalladmin/goalladmin/server/migrations"
@@ -50,6 +57,13 @@ type Deps struct {
 	Dict    *dict.Service    // 字典服务；Init 阶段为 nil，Routes 起可用（无数据库时为 nil）
 	Monitor monitor.Service  // 服务器状态（D-030）；New 之后即可用
 	Audit   audit.Service    // 安全审计（D-032）：错误日志、安全事件、调查时间线；New 之后即可用
+	IPACL   *ipacl.Service   // IP 黑名单与白名单（D-062）；New 之后即可用，Setup 时读入名单（无数据库时为 nil）
+	Orgs    *org.Service     // 主体与主体账号（D-065）：代理商、商户；New 之后即可用（无数据库时为 nil）
+	// VerifyCaptcha 消费本端一次性验证码；Routes 起可用，错误答案也消费。
+	VerifyCaptcha func(ctx context.Context, portal, id, answer string) bool
+	// NewRateWindow 创建共用的操作计数窗口；namespace 区分端和用途，同名窗口的参数必须一致（D-076）。
+	// New 之后即可用，没配 Redis 或不可用时使用本实例内存。
+	NewRateWindow func(namespace string, limit int, span time.Duration, maxKeys int) RateWindow
 }
 
 // Module 是业务模块的接口（规范 §4.3）。
@@ -98,9 +112,28 @@ func WithClock(now func() time.Time) Option {
 	return func(a *App) { a.now = now }
 }
 
-// WithBcryptCost 调整密码哈希代价（测试用，降低到 4 加快测试）。
+// WithPasswordHashParams 调整 Argon2id 的内存（KiB）和轮数。只给测试用：降到 64 KiB、1 轮加快测试；
+// 生产用的参数是固定的（D-070），不合法的值按默认参数处理。配置选的是别的算法时不起作用。
+func WithPasswordHashParams(memoryKiB, iterations uint32) Option {
+	return func(a *App) { a.argonMemory, a.argonTime = memoryKiB, iterations }
+}
+
+// WithBcryptCost 调整 bcrypt 的代价。只给测试用：降到 4 加快测试；生产用的是 12，不合法的值按 12 处理。
+// 配置选的是别的算法时不起作用——默认的 Argon2id 用 WithPasswordHashParams。
 func WithBcryptCost(cost int) Option {
 	return func(a *App) { a.bcryptCost = cost }
+}
+
+// WithPBKDF2Iterations 调整 PBKDF2 的迭代次数。只给测试用：降到几十次加快测试；生产用的是 60 万次（SHA-256）、
+// 22 万次（SHA-512）（D-072），不合法的值按生产用的处理。配置选的是别的算法时不起作用。
+func WithPBKDF2Iterations(n uint32) Option {
+	return func(a *App) { a.pbkdf2Iterations = n }
+}
+
+// WithoutMigrations 表示这个程序不执行迁移（D-061）：代理商、商户程序和平台程序共用一个数据库，表结构只由平台程序改。
+// 启动时只读地核对迁移都已应用（db.MigrateCheck），落后就拒绝启动；Migrate 直接返回错误。
+func WithoutMigrations() Option {
+	return func(a *App) { a.migrateCheckOnly = true }
 }
 
 // WithStatusCacheTTL 调整会话与账号状态缓存的时长（测试用）。
@@ -118,6 +151,10 @@ type App struct {
 	started    []Module
 	setupDone  bool
 
+	sessionCleanupCancel context.CancelFunc
+	sessionCleanupDone   chan struct{}
+	readiness            *readinessCheck
+
 	portalGroups   map[string]*gin.RouterGroup
 	authenticators map[string]*authimpl.Authenticator
 	authorizer     Authorizer
@@ -128,10 +165,35 @@ type App struct {
 	routes         []Route
 	rawRoutes      []RawRoute
 
-	now            func() time.Time
-	bcryptCost     int
-	pwdParallel    int // 同时核对密码的上限，0 用默认值；只有测试会设（D-058）
+	now              func() time.Time
+	migrateCheckOnly bool // 不执行迁移，只核对（WithoutMigrations）
+	// 密码哈希的参数，只有测试会设（D-070、D-072）：零值用生产用的参数。算法由配置 server.passwordHash 定
+	argonMemory, argonTime uint32
+	bcryptCost             int
+	pbkdf2Iterations       uint32
+	hasher                 *password.Hasher // 整个进程共用的密码哈希器：各个端的认证器、主体服务都用它
+	pwdParallel            int              // 同时做密码计算的上限，只有测试会设；0 用配置 server.passwordParallel，再没有就按 CPU 数（D-058、D-070）
+	pwdWait                time.Duration    // 登录、解锁在位置占满时最多等多久，只有测试会设；0 用默认值（D-071）
+	// pwdBudget 是整个进程共用的密码计算位置（D-068、D-071）：登录、解锁可以用全部，本人改密、后台生成密码哈希最多占一半
+	pwdBudget      *ratelimit.Budget
 	statusCacheTTL time.Duration
+	// redis 是可选的 Redis 连接（D-074）：没配 redis.addr 时是 nil，程序只用本实例的内存
+	redis              *redisx.Client
+	invalidationSource string
+	invalidationReady  atomic.Bool
+	invalidationCancel context.CancelFunc
+	invalidationDone   chan struct{}
+}
+
+// hashPassword 用进程的哈希器生成密码哈希，先在密码计算的位置里占一个（后一类：最多占一半，D-068、D-071）；
+// 满了回 429，不排队。主体服务（org.NewInitialPassword）用它。
+func (a *App) hashPassword(plain string) (string, error) {
+	leave, ok := a.pwdBudget.EnterBackground()
+	if !ok {
+		return "", httpx.ErrTooManyRequests
+	}
+	defer leave()
+	return a.hasher.Hash(plain)
 }
 
 // New 校验配置、初始化日志和数据库、装配 HTTP 引擎。不启动任何东西。
@@ -151,17 +213,67 @@ func New(cfg *conf.Config, opts ...Option) (*App, error) {
 	for _, o := range opts {
 		o(a)
 	}
+	// 上限：测试直接设的字段优先，其次是配置，都没有就按 CPU 数（D-070 第 8 条）
+	a.pwdBudget = ratelimit.NewBudget(cmp.Or(a.pwdParallel, cfg.Server.PasswordParallel, authimpl.PasswordParallel()),
+		cmp.Or(a.pwdWait, authimpl.PasswordWait))
+	// 算法由配置定（conf.Validate 已经保证取值合法）；参数是生产用的，测试可以调低
+	params := password.ParamsFor(password.Algorithm(cfg.Server.PasswordHash))
+	if a.argonMemory != 0 || a.argonTime != 0 {
+		params.Memory, params.Time = a.argonMemory, a.argonTime
+	}
+	if a.bcryptCost != 0 {
+		params.Cost = a.bcryptCost
+	}
+	if a.pbkdf2Iterations != 0 {
+		params.Iterations = a.pbkdf2Iterations
+	}
+	a.hasher = password.NewHasher(params)
 	if a.deps.Log == nil {
 		a.deps.Log = logx.New(cfg.Log.Level, cfg.Log.Format, nil)
 	}
 	slog.SetDefault(a.deps.Log)
 
-	if !a.dbProvided {
-		gdb, err := db.Open(cfg.Database, a.deps.Log)
+	// Redis（可选，D-074）：版本太低是配置错误，拒绝启动；连不上不拒绝，按不可用处理、后台继续探测
+	if rc := cfg.Redis; rc.Enabled() {
+		id, err := newInvalidationSource()
 		if err != nil {
 			return nil, err
 		}
+		a.invalidationSource = id
+		client, err := redisx.Open(redisx.Options{
+			Addr: rc.Addr, Username: rc.Username, Password: rc.Password, DB: rc.DB, TLS: rc.TLS,
+			KeyPrefix: rc.KeyPrefix, ConnectWait: rc.ConnectWait, Log: a.deps.Log, Check: checkRedisState,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("app: %w", err)
+		}
+		a.redis = client
+	}
+	a.setupRateWindows()
+	if !a.dbProvided {
+		gdb, err := db.Open(cfg.Database, a.deps.Log)
+		if err != nil {
+			_ = a.closeRedis()
+			return nil, err
+		}
 		a.deps.DB = gdb
+	}
+	if a.deps.DB != nil {
+		a.deps.IPACL = ipacl.New(ipacl.Options{DB: a.deps.DB, Log: a.deps.Log, Now: func() time.Time { return a.now() },
+			OnChange: func() { a.publishInvalidation("ip", "", "") },
+		})
+		a.deps.Orgs = org.New(org.Options{Now: func() time.Time { return a.now() }, Hash: a.hashPassword,
+			OnAccountChange: a.accountChanged, OnSessionChange: a.sessionChanged, OnOrgChange: a.orgChanged,
+			// 授权服务在后面才建好（Routes 阶段起可用），用到时再取
+			ClearRoles: func(ctx context.Context, portal string, userID uint64) error {
+				if a.deps.RBAC == nil {
+					// 没有内置授权服务的装配没有角色可清（D-101）：会话照样吊销，这里留一条记录
+					a.deps.Log.WarnContext(ctx, "更换主账号：没有内置授权服务，原主账号的角色没有清理", "portal", portal, "user_id", userID)
+					return nil
+				}
+				return a.deps.RBAC.ClearUserRoles(ctx, portal, userID)
+			},
+		})
 	}
 
 	if cfg.Server.IsRelease() {
@@ -178,6 +290,7 @@ func New(cfg *conf.Config, opts ...Option) (*App, error) {
 	e.RedirectTrailingSlash = false
 	e.RedirectFixedPath = false
 	if err := e.SetTrustedProxies(cfg.Server.TrustedProxies); err != nil {
+		_ = a.closeRedis()
 		return nil, fmt.Errorf("app: trustedProxies: %w", err)
 	}
 	// 请求统计放在最前面，耗时包含整个处理过程；健康检查不计入（D-030）。
@@ -188,7 +301,7 @@ func New(cfg *conf.Config, opts ...Option) (*App, error) {
 		e.Use(a.metrics.Middleware())
 	}
 	// 审计排在 Recovery 外层：请求结束后能看到 panic 转成的 500（D-032）。
-	a.audit = auditimpl.New(auditimpl.Options{DB: a.deps.DB, Log: a.deps.Log, Now: func() time.Time { return a.now() }, Skip: []string{healthPath, readyPath}})
+	a.audit = auditimpl.New(auditimpl.Options{DB: a.deps.DB, Log: a.deps.Log, Now: func() time.Time { return a.now() }, Skip: []string{healthPath, readyPath}, KnownPortal: func(code string) bool { _, ok := a.deps.Portals.Get(code); return ok }})
 	a.deps.Audit = a.audit
 	e.Use(
 		middleware.ContextLogger(a.deps.Log),
@@ -200,6 +313,8 @@ func New(cfg *conf.Config, opts ...Option) (*App, error) {
 		middleware.Recovery(),
 		middleware.SecurityHeaders(),
 		middleware.BodyLimit(cfg.Server.MaxBodyBytes),
+		// IP 黑名单（D-062）：排在审计之后，被拒的请求照样记安全事件；健康检查不受影响
+		a.ipDenyMiddleware(),
 	)
 	e.NoRoute(middleware.NoRoute())
 	e.NoMethod(middleware.NoMethod())
@@ -265,8 +380,14 @@ func (a *App) MigrationSets() []MigrationSet {
 	return out
 }
 
+// ErrMigrationsDisabled 由不执行迁移的程序（WithoutMigrations）的 Migrate 返回。
+var ErrMigrationsDisabled = errors.New("app: 这个程序不执行迁移，表结构由平台程序迁移（server migrate up）")
+
 // Migrate 执行框架迁移和各模块的迁移。
 func (a *App) Migrate(ctx context.Context) error {
+	if a.migrateCheckOnly {
+		return ErrMigrationsDisabled
+	}
 	if a.deps.DB == nil {
 		return errors.New("app: 没有数据库连接，无法迁移")
 	}
@@ -323,8 +444,10 @@ func (a *App) Setup() error {
 	if a.deps.DB != nil && a.authorizer == nil {
 		svc, err := rbac.NewService(rbac.Options{
 			Registry: a.deps.Perms, Base: a.Context(context.Background()), Log: a.deps.Log, Now: a.now, CacheTTL: a.statusCacheTTL,
-			Portals: a.deps.Portals,
-			// 锁内认定操作人时确认会话仍然有效（D-046）：用会话表的普通读，不走状态缓存
+			Portals:        a.deps.Portals,
+			OnPolicyChange: func() { a.publishInvalidation("policy", "", "") },
+			OnMenuChange:   func(portal string) { a.publishInvalidation("menu", portal, "") },
+			// 未使用会话锁时的兼容读取：直接查会话表，不走状态缓存。
 			SessionActive: func(ctx context.Context, portal, sid string) (bool, error) {
 				an, ok := a.authenticators[portal]
 				if !ok {
@@ -334,17 +457,26 @@ func (a *App) Setup() error {
 				if err != nil || sess == nil {
 					return false, err
 				}
-				return sess.Portal == portal && sess.Active(a.now().UTC()), nil
+				if sess.Portal != portal || !sess.Active(a.now().UTC()) {
+					return false, nil
+				}
+				if sess.LockedAt != nil {
+					return false, httpx.ErrSessionLocked
+				}
+				return true, nil
 			},
-			// 本人写操作在事务里锁住自己的会话行再确认有效（D-059）：吊销写的也是这一行，两边排队
+			// 本人及管理写操作锁住操作人会话，确认有效且未锁屏（D-059、D-089、D-106）：状态写同一行，两边排队。
 			LockSession: func(ctx context.Context, portal, sid string) (bool, error) {
 				an, ok := a.authenticators[portal]
 				if !ok {
 					return false, nil
 				}
-				err := an.Sessions().LockActive(ctx, portal, sid)
+				err := an.Sessions().LockWritable(ctx, portal, sid)
 				if errors.Is(err, session.ErrNotFound) || errors.Is(err, session.ErrInactive) {
 					return false, nil
+				}
+				if errors.Is(err, session.ErrLocked) {
+					return false, httpx.ErrSessionLocked
 				}
 				return err == nil, err
 			},
@@ -358,10 +490,16 @@ func (a *App) Setup() error {
 	if err := a.setupDicts(); err != nil {
 		return err
 	}
+	if a.deps.IPACL != nil {
+		if err := a.deps.IPACL.Load(a.Context(context.Background())); err != nil {
+			return fmt.Errorf("app: %w", err)
+		}
+	}
 	for _, m := range a.modules {
 		m.Routes(a.router)
 	}
 	a.setupDone = true
+	a.startInvalidations()
 	for _, r := range a.rawRoutes {
 		a.deps.Log.Info("raw route", "method", r.Method, "path", r.Path, "purpose", r.Purpose)
 	}
@@ -386,7 +524,9 @@ func (a *App) setupDicts() error {
 	if a.deps.DB == nil {
 		return nil
 	}
-	svc := dict.NewService(dict.Options{Log: a.deps.Log, Now: a.now, CacheTTL: a.statusCacheTTL, PortalOK: portalOK})
+	svc := dict.NewService(dict.Options{Log: a.deps.Log, Now: a.now, CacheTTL: a.statusCacheTTL, PortalOK: portalOK,
+		OnChange: func(code string) { a.publishInvalidation("dict", "", code) },
+	})
 	if err := svc.Sync(a.Context(context.Background()), decls); err != nil {
 		return fmt.Errorf("app: %w", err)
 	}
@@ -394,9 +534,29 @@ func (a *App) setupDicts() error {
 	return nil
 }
 
+// CheckMigrations 只读地核对全部迁移来源都已应用（D-061），不执行任何迁移。
+func (a *App) CheckMigrations(ctx context.Context) error {
+	if a.deps.DB == nil {
+		return errors.New("app: 没有数据库连接，无法核对迁移")
+	}
+	ctx = a.Context(ctx)
+	for _, set := range a.MigrationSets() {
+		if err := db.MigrateCheck(ctx, a.deps.DB, set.FS, set.Dir, set.Table); err != nil {
+			return fmt.Errorf("%s: %w", set.Name, err)
+		}
+	}
+	return nil
+}
+
 // Start 完成装配（含自动迁移）并启动模块的后台任务。不监听 HTTP。
+// 不执行迁移的程序（WithoutMigrations）只核对迁移，落后就拒绝启动。
 func (a *App) Start(ctx context.Context) error {
-	if a.deps.Conf.Migrate.Auto && a.deps.DB != nil {
+	switch {
+	case a.migrateCheckOnly && a.deps.DB != nil:
+		if err := a.CheckMigrations(ctx); err != nil {
+			return err
+		}
+	case a.deps.Conf.Migrate.Auto && a.deps.DB != nil:
 		if err := a.Migrate(ctx); err != nil {
 			return err
 		}
@@ -413,12 +573,17 @@ func (a *App) Start(ctx context.Context) error {
 		}
 		a.started = append(a.started, m)
 	}
+	a.startSessionCleanup(ctx)
 	return nil
 }
 
 // Stop 按启动的逆序停止模块并关闭数据库。
 func (a *App) Stop(ctx context.Context) error {
 	var errs []error
+	if a.readiness != nil {
+		a.readiness.stop()
+	}
+	a.stopSessionCleanup()
 	for i := len(a.started) - 1; i >= 0; i-- {
 		if err := a.started[i].Stop(ctx); err != nil {
 			errs = append(errs, fmt.Errorf("模块 %s 停止失败: %w", a.started[i].Name(), err))
@@ -427,12 +592,30 @@ func (a *App) Stop(ctx context.Context) error {
 	a.started = nil
 	// 审计记录里攒着的次数在关库前写完
 	a.audit.Stop(ctx)
+	if err := a.closeRedis(); err != nil {
+		errs = append(errs, err)
+	}
 	if !a.dbProvided {
 		if err := db.Close(a.deps.DB); err != nil {
 			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// closeRedis 关闭 Redis 连接（没配时什么都不做）。
+func (a *App) closeRedis() error {
+	if a.redis == nil {
+		return nil
+	}
+	if a.invalidationCancel != nil {
+		a.invalidationCancel()
+		<-a.invalidationDone
+	}
+	if err := a.redis.Close(); err != nil {
+		return fmt.Errorf("redis close: %w", err)
+	}
+	return nil
 }
 
 // Run 启动一切并阻塞到 ctx 取消或收到 SIGINT/SIGTERM，然后优雅关停。
@@ -456,6 +639,9 @@ func (a *App) Run(ctx context.Context) error {
 		BaseContext:       func(net.Listener) context.Context { return a.Context(context.Background()) },
 	}
 	errCh := make(chan error, 1)
+	if msg, ok := debugExposure(sc); ok {
+		a.deps.Log.Warn(msg, "addr", sc.Addr, "mode", sc.Mode)
+	}
 	go func() {
 		a.deps.Log.Info("http server listening", "addr", srv.Addr, "mode", a.deps.Conf.Server.Mode)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -498,20 +684,32 @@ func (a *App) contextDB() gin.HandlerFunc {
 
 // registerHealth 注册 /healthz 与 /readyz（规范 §12.1：不带版本和配置信息）。
 func (a *App) registerHealth() {
+	a.readiness = &readinessCheck{now: time.Now, ping: func(ctx context.Context) error {
+		if a.deps.DB == nil {
+			return httpx.ErrUnavailable
+		}
+		return db.Ping(ctx, a.deps.DB)
+	}}
 	a.router.Raw(http.MethodGet, healthPath, "存活探针", func(c *gin.Context) {
 		httpx.OK(c, gin.H{"status": "ok"})
 	})
 	a.router.Raw(http.MethodGet, readyPath, "就绪探针（检查数据库）", func(c *gin.Context) {
-		if a.deps.DB == nil {
-			httpx.Fail(c, httpx.ErrUnavailable)
-			return
-		}
-		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
-		defer cancel()
-		if err := db.Ping(ctx, a.deps.DB); err != nil {
+		if err := a.readiness.check(c.Request.Context()); err != nil {
 			httpx.Fail(c, httpx.ErrUnavailable.WithCause(err))
 			return
 		}
 		httpx.OK(c, gin.H{"status": "ok"})
 	})
+}
+
+// debugExposure 在 debug 模式监听非回环地址时给出一条启动告警（D-098）：debug 模式不做 release 的启动校验
+// （JWT 密钥、数据库密码、allowedOrigins），没配 allowedOrigins 时不核对 Origin，刷新 Cookie 不带 Secure。
+// 本机开发没问题；对外提供服务的实例要用 release。
+func debugExposure(sc conf.Server) (string, bool) {
+	if sc.IsRelease() || !sc.ListensBeyondLoopback() {
+		return "", false
+	}
+	return "debug mode is listening on a non-loopback address: release startup checks are skipped, " +
+		"Origin is not checked while server.allowedOrigins is empty, and the refresh cookie is sent without Secure; " +
+		"set server.mode to release (GA_SERVER_MODE=release) for anything other than local development", true
 }

@@ -6,6 +6,7 @@
 # 标准库版本可确认、可复现（标准库的安全修复都按补丁版本发布）；出新补丁时手动改这一行并重新构建。
 # go.mod 里的 go 指令是最低语言版本，不需要跟着升。
 FROM golang:1.27.1-alpine AS build
+ARG PORTAL=platform
 WORKDIR /src
 COPY server/go.mod server/go.sum ./
 RUN go mod download
@@ -13,10 +14,18 @@ COPY server/main.go ./
 COPY server/core core/
 COPY server/modules modules/
 COPY server/migrations migrations/
-RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/server .
+COPY server/cmd/agent cmd/agent/
+COPY server/cmd/merchant cmd/merchant/
+COPY server/internal internal/
 # 编译进二进制的第三方模块和 Go 标准库的许可证原文（D-028）；某个模块没有许可证文件时构建失败
 COPY scripts/go-licenses.sh /tmp/go-licenses.sh
-RUN CGO_ENABLED=0 sh /tmp/go-licenses.sh /src /out/third-party-licenses.txt
+RUN case "$PORTAL" in \
+      platform) package=. ;; \
+      agent|merchant) package=./cmd/$PORTAL ;; \
+      *) echo 'PORTAL must be platform, agent or merchant' >&2; exit 1 ;; \
+    esac && \
+    CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/server "$package" && \
+    CGO_ENABLED=0 sh /tmp/go-licenses.sh /src /out/third-party-licenses.txt "$package"
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/server /server

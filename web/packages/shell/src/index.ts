@@ -4,7 +4,7 @@ export { createPortalApp } from './app'
 export type { PortalAppOptions } from './app'
 
 
-export { usePortal, useLanguages, apiPrefix } from './context'
+export { usePortal, useLanguages, apiPrefix, isScoped } from './context'
 export type { PortalContext } from './context'
 import { usePortal } from './context'
 
@@ -21,6 +21,28 @@ export type { ViewGlob, ViewMap, MenuRouteMeta } from './router/menu'
 
 export { useLayoutStore } from './layout/store'
 
+// 主体端（代理商、商户）自己的后台的接口（D-067）。内置页面由 createPortalApp 在 scoped 时按需加载，不从这里导出
+export { orgApi, orgPerm } from './org/api'
+export type {
+  OrgAccount,
+  OrgAccountInput,
+  OrgAccountUpdate,
+  OrgIPAllow,
+  OrgIPEntry,
+  OrgIPRule,
+  OrgLoginLog,
+  OrgLogQuery,
+  OrgOperationLog,
+  OrgOverview,
+  OrgPermGroup,
+  OrgProfile,
+  OrgRole,
+  OrgRoleInput,
+  OrgRoleRef,
+  OrgSession,
+  OrgSummary,
+} from './org/api'
+
 export { default as GaLogo } from './components/GaLogo.vue'
 export { default as GaCountUp } from './components/GaCountUp.vue'
 export { default as GaSparkline } from './components/GaSparkline.vue'
@@ -29,7 +51,7 @@ export { default as GaAvatar } from './components/GaAvatar.vue'
 export { AVATAR_PRESETS, presetAvatarSrc, parseAvatar, avatarInitial } from './avatar'
 export type { AvatarPreset, AvatarRef } from './avatar'
 export { prefersReducedMotion, easeOutCubic, countFrame, sparkGeometry } from './motion'
-export { formatBytes, formatRelative, splitDuration } from './format'
+export { formatBytes, formatRelative, formatTime, splitDuration } from './format'
 
 export { createClient, HeaderClient } from './request/client'
 export type { Client, ClientOptions, TokenStore } from './request/client'
@@ -50,7 +72,7 @@ export { default as GaLanguageSwitch } from './components/GaLanguageSwitch.vue'
 export { default as GaI18nInputs } from './components/GaI18nInputs.vue'
 
 export { ApiError, Codes, isApiError } from './types'
-export type { Envelope, PageData, PageQuery, FieldError, TokenResponse, MeUser, MenuTree, MeResponse, PwdPolicy } from './types'
+export type { Envelope, PageData, PageQuery, FieldError, TokenResponse, MeUser, MeOrg, MenuTree, MeResponse, PwdPolicy } from './types'
 
 // 业务页面常用的第三方入口，统一从这里拿，端应用不必直接依赖 vue-i18n。
 export { useI18n } from 'vue-i18n'
@@ -60,11 +82,5 @@ export function useRequest() {
   return usePortal().client
 }
 
-/** 把 ISO 时间格式化成本地时间；空值返回空串。 */
-export function formatTime(v: string | null | undefined): string {
-  if (!v) return ''
-  const d = new Date(v)
-  if (Number.isNaN(d.getTime())) return v
-  const p = (n: number) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
-}
+export { GaDataCenter } from './data-center/component'
+export type { DashboardData } from './data-center/types'

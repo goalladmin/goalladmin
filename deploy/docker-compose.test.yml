@@ -1,5 +1,5 @@
-# 本地开发与测试用 MySQL。`make test-db-up` 启动，`make test-db-down` 销毁（数据在 tmpfs 里，不持久）。
-# 与 Makefile 里 GA_TEST_DSN 和 `make run` 的默认值一致；mysql-init/ 里的脚本给测试用户建库权限并创建开发库 goalladmin。
+# 本地开发与测试用 MySQL 和 Redis。`make test-db-up` 启动，`make test-db-down` 销毁（数据不持久）。
+# 与 Makefile 里 GA_TEST_DSN、GA_TEST_REDIS 和 `make run` 的默认值一致；mysql-init/ 里的脚本给测试用户建库权限并创建开发库 goalladmin。
 services:
   mysql-test:
     image: mysql:8.0
@@ -21,3 +21,16 @@ services:
       - ./mysql-init:/docker-entrypoint-initdb.d:ro
     tmpfs:
       - /var/lib/mysql
+
+  # 测试用 Redis（D-074）。镜像是框架支持的最低版本 6.0：测试在最低版本上通过，才敢说支持它。
+  # 宿主机端口用 6380，不和本机自己装的 Redis（6379）冲突。不落盘。
+  redis-test:
+    image: redis:6.0
+    command: redis-server --save "" --appendonly no
+    ports:
+      - "127.0.0.1:6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20

@@ -75,7 +75,7 @@ func newMenuApp(t *testing.T, gdb *gorm.DB, menus []rbac.MenuNode) *app.App {
 	p := cfg.Portals[conf.DefaultPortalCode]
 	p.JWTSecret = "platform-test-secret-0123456789abcdef0123456789"
 	cfg.Portals[conf.DefaultPortalCode] = p
-	a, err := app.New(cfg, app.WithDB(gdb), app.WithLogger(logx.New("error", "text", io.Discard)), app.WithBcryptCost(4))
+	a, err := app.New(cfg, app.WithDB(gdb), app.WithLogger(logx.New("error", "text", io.Discard)), app.WithPasswordHashParams(64, 1))
 	require.NoError(t, err)
 	a.Register(system.Module(), &menuModule{menus: menus})
 	require.NoError(t, a.Setup())

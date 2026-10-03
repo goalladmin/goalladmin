@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
@@ -207,6 +208,7 @@ func TestBindJSONStrict_RejectsUnknownFields(t *testing.T) {
 		rec := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(rec)
 		c.Request = httptest.NewRequest("PUT", "/", strings.NewReader(raw))
+		c.Request.Header.Set("Content-Type", "application/json")
 		var b body
 		return httpx.BindJSONStrict(c, &b)
 	}
@@ -216,6 +218,10 @@ func TestBindJSONStrict_RejectsUnknownFields(t *testing.T) {
 	require.ErrorIs(t, run(`{"name":"ok"}{"name":"again"}`), httpx.ErrBadRequest)
 	require.ErrorIs(t, run(`{"name":"toolong"}`), httpx.ErrValidation)
 	require.ErrorIs(t, run(`not json`), httpx.ErrBadRequest)
+	for _, suffix := range []string{"]", "}", " true", " null", " trailing"} {
+		require.ErrorIs(t, run(`{"name":"ok"}`+suffix), httpx.ErrBadRequest)
+	}
+	require.NoError(t, run("{\"name\":\"ok\"} \r\n\t"))
 }
 
 // D-026：Accept-Language 匹配到 11 种语言之一；缺文案时按回退链。
@@ -332,4 +338,56 @@ func TestPage_99_PageNumberCapped(t *testing.T) {
 	require.Equal(t, httpx.MaxPage, q.Page)
 	require.Equal(t, (httpx.MaxPage-1)*200, q.Offset())
 	require.Equal(t, 3, httpx.PageQuery{Page: 3, PageSize: 20}.Normalize().Page)
+}
+
+// 179（D-095）：JSON 绑定只收声明成 JSON 的请求体。类型不对的不解析、回 3002，结构体保持零值；
+// application/json（可带参数）和 +json 结尾的类型照常绑定。
+func TestBindJSON_179_RequiresJSONContentType(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	type body struct {
+		Name string `json:"name" binding:"required"`
+	}
+	binders := map[string]func(*gin.Context, any) error{"BindJSON": httpx.BindJSON, "BindJSONStrict": httpx.BindJSONStrict}
+	run := func(bind func(*gin.Context, any) error, contentType string) (body, error) {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest("POST", "/", strings.NewReader(`{"name":"ok"}`))
+		if contentType != "" {
+			c.Request.Header.Set("Content-Type", contentType)
+		}
+		var b body
+		err := bind(c, &b)
+		return b, err
+	}
+	for name, bind := range binders {
+		for _, ct := range []string{"", "text/plain", "application/x-www-form-urlencoded", "multipart/form-data; boundary=x",
+			"application/octet-stream", "application/jsonx", "json", "application/json; charset", "text/json+xml"} {
+			b, err := run(bind, ct)
+			require.ErrorIs(t, err, httpx.ErrBadRequest, "%s %q", name, ct)
+			require.Equal(t, httpx.CodeBadRequest, httpx.AsError(err).Code, "%s %q", name, ct)
+			require.Empty(t, b.Name, "%s %q：类型不对的请求体不解析", name, ct)
+		}
+		for _, ct := range []string{"application/json", "application/json; charset=utf-8", "APPLICATION/JSON", "application/merge-patch+json"} {
+			b, err := run(bind, ct)
+			require.NoError(t, err, "%s %q", name, ct)
+			require.Equal(t, "ok", b.Name, "%s %q", name, ct)
+		}
+	}
+}
+
+// 183（D-099）：ParseTime 只收 RFC 3339、换算成 UTC 后年份在 1–9999 之间的时间。
+func TestParseTime_183(t *testing.T) {
+	for _, in := range []string{"2026-10-03T08:00:00Z", "2026-10-03T08:00:00+08:00", "0001-01-01T00:00:00Z", "9999-12-31T23:59:59Z", "2026-10-03T08:00:00.123456789Z"} {
+		got, valid := httpx.ParseTime(in)
+		require.True(t, valid, in)
+		want, err := time.Parse(time.RFC3339, in)
+		require.NoError(t, err)
+		require.True(t, want.Equal(got), in)
+	}
+	for _, bad := range []string{"", "2026-10-03", "2026-10-03 08:00:00", "not a time",
+		"0000-01-01T00:00:00Z", "0000-12-31T23:59:59Z", "0001-01-01T00:00:00+00:01", "9999-12-31T23:59:59-00:01", "9999-12-31T23:59:59-23:59"} {
+		got, valid := httpx.ParseTime(bad)
+		require.False(t, valid, bad)
+		require.True(t, got.IsZero(), bad)
+	}
 }

@@ -1,8 +1,11 @@
 package httpx
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
+	"mime"
 	"net/http"
 	"reflect"
 	"strings"
@@ -37,29 +40,64 @@ func useJSONFieldNames() {
 // Bind 按 Content-Type 绑定并校验请求参数（JSON / form / query）。
 // 校验失败返回 CodeValidation 并带字段明细；无法解析返回 CodeBadRequest。
 func Bind(c *gin.Context, obj any) error {
+	if jsonContentType(c) {
+		return BindJSON(c, obj)
+	}
 	useJSONFieldNames()
 	return toBindError(c.ShouldBind(obj))
 }
 
-// BindJSON 只从 JSON 请求体绑定。
+// jsonContentType 报告请求声明的类型是不是 JSON：application/json，或以 +json 结尾的类型（D-095）。
+func jsonContentType(c *gin.Context) bool {
+	if c.Request == nil {
+		return false
+	}
+	mt, _, err := mime.ParseMediaType(c.Request.Header.Get("Content-Type"))
+	if err != nil {
+		return false
+	}
+	return mt == "application/json" || strings.HasSuffix(mt, "+json")
+}
+
+// errNotJSON：请求体没有声明成 JSON。操作日志按声明的类型记请求体，绑定也只认这一种，
+// 绑定和记录使用同一份声明成 JSON 的文档（D-095、D-108）。
+func errNotJSON() error {
+	return ErrBadRequest.WithCause(errors.New("请求体的 Content-Type 不是 application/json"))
+}
+
+// BindJSON 只从 JSON 请求体绑定。Content-Type 不是 JSON 的请求不解析，回 CodeBadRequest（D-095）。
 func BindJSON(c *gin.Context, obj any) error {
-	useJSONFieldNames()
-	return toBindError(c.ShouldBindJSON(obj))
+	return BindJSONStrict(c, obj)
 }
 
 // BindJSONStrict 只从 JSON 请求体绑定，并且拒绝结构体里没有的字段（回 CodeBadRequest）。
 // 用在"只允许改某几项"的接口上：请求里夹带了不允许改的字段时明确报错，而不是悄悄忽略（D-025）。
+// 和 BindJSON 一样只收声明成 JSON 的请求体（D-095）。
 func BindJSONStrict(c *gin.Context, obj any) error {
 	useJSONFieldNames()
 	if c.Request == nil || c.Request.Body == nil {
 		return ErrBadRequest
 	}
-	dec := json.NewDecoder(c.Request.Body)
+	if !jsonContentType(c) {
+		return errNotJSON()
+	}
+	raw, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		return toBindError(err)
+	}
+	if err := checkJSONDocument(raw, reflect.TypeOf(obj)); err != nil {
+		return toBindError(err)
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(obj); err != nil {
 		return toBindError(err)
 	}
-	if dec.More() {
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err != nil {
+			return toBindError(err)
+		}
 		return ErrBadRequest.WithCause(errors.New("请求体里有多余的内容"))
 	}
 	if binding.Validator == nil {

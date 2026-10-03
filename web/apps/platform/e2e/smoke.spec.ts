@@ -1,5 +1,5 @@
 // 冒烟测试（规范 §13.3）：登录 → 强制改密 → 菜单按权限显示 → 数据中心、安全监控、工作台 → 建用户 → 建角色并授权 → 字典改显示后业务页面生效 →
-// 菜单改名、建分组并拖入后侧边栏立即生效 →
+// 菜单改名、建分组并拖入后侧边栏立即生效 → 开通代理商、商户（初始密码只显示一次） →
 // 被授权用户登录只看到对应菜单 → 登出。全部走真实后端。
 //
 // 需要环境变量：GA_E2E_ADMIN（超管账号）、GA_E2E_PASSWORD（其初始密码，首次登录必须改）。
@@ -51,7 +51,9 @@ async function logout(page: Page) {
 }
 
 function menuItem(page: Page, name: string) {
-  return page.locator('.ga-sidebar').getByRole('menuitem', { name, exact: true })
+  const item = page.locator('.ga-sidebar').getByRole('menuitem', { name, exact: true })
+  // 目录只点标题；整个 li 包含折叠动画中的子菜单，中心点可能落在别的菜单上。
+  return item.locator(':scope > .el-sub-menu__title').or(item.and(page.locator('.el-menu-item')))
 }
 
 // 打开目录下的菜单：目录折叠着才点开它
@@ -158,9 +160,12 @@ test('超管：数据中心、安全监控、工作台都是真实数据，数�
   await expect(page.getByTestId('ws-greeting')).toContainText(admin)
   await expect(page.getByTestId('ws-devices')).toContainText('当前设备')
   await expect(page.getByTestId('ws-recent')).toContainText('修改密码')
-  // 快捷入口按菜单顺序取前 8 个；运维中心（D-032）排在权限管理前面
-  await page.getByTestId('ws-shortcuts').getByText('操作日志').click()
-  await expect(page).toHaveURL(/\/ops\/operation-logs$/)
+  // 快捷入口按菜单顺序取前 8 个：根目录的数据中心、安全监控之后是代理商管理、商户管理（D-066，排序 100、110），
+  // 运维中心排不进前 8 个；菜单名有包含关系（"操作日志"和"商户操作日志"），按全名点
+  const shortcuts = page.getByTestId('ws-shortcuts')
+  await expect(shortcuts.getByText('操作日志', { exact: true })).toHaveCount(0)
+  await shortcuts.getByText('商户列表', { exact: true }).click()
+  await expect(page).toHaveURL(/\/merchant\/list$/)
   await logout(page)
 })
 
@@ -396,9 +401,156 @@ test('超管：安全设置——只读展示生效的策略、范围和配置�
   await logout(page)
 })
 
+test('超管：IP 访问控制——封禁和解除、不能封自己、白名单不含自己的 IP 时保存被拒、账号白名单设了再清空（D-062）', async ({ page }) => {
+  // 每次运行用不同的文档地址，测试库不清库
+  const victim = `198.51.100.${(Date.now() % 250) + 1}`
+  await login(page, admin, adminPwd)
+  await expect(page).toHaveURL(/\/dashboard\/data-center$/)
+  await openMenu(page, '系统设置', 'IP 访问控制')
+  await expect(page).toHaveURL(/\/settings\/ip$/)
+
+  // 黑名单：封自己当前的 IP 被拒绝，对话框里说明原因
+  await page.getByTestId('ip-block-open').click()
+  await input(page, 'ip-block-cidr').fill('127.0.0.1')
+  await page.getByTestId('ip-block-submit').click()
+  await expect(page.getByTestId('ip-block-error')).toContainText('把你当前的 IP 挡在外面')
+  // 封一个别的地址：出现在列表里，有到期时间；再解除
+  await input(page, 'ip-block-cidr').fill(victim)
+  await page.getByTestId('ip-block-submit').click()
+  await expect(page.getByTestId('ip-block-error')).toBeHidden()
+  const row = page.getByTestId('ip-deny-table').locator('tr', { hasText: victim })
+  await expect(row).toBeVisible()
+  await expect(row).not.toContainText('永久')
+  await row.getByTestId('ip-unblock').click()
+  await page.getByRole('button', { name: '确定' }).click()
+  await expect(row).toHaveCount(0)
+
+  // 平台白名单：显示当前 IP；只填别的地址保存会被拒绝（会把自己挡在外面），名单保持为空
+  await page.getByTestId('ip-tabs').getByRole('tab', { name: '平台白名单' }).click()
+  const allow = page.getByTestId('ip-allow-editor').first()
+  await expect(allow.getByTestId('ip-your')).toHaveText('127.0.0.1')
+  await allow.getByTestId('ip-add-row').click()
+  await input(page, 'ip-cidr-0').fill('10.9.8.7')
+  await page.getByTestId('ip-allow-save').click()
+  await expect(page.getByTestId('ip-allow-error')).toContainText('把你当前的 IP 挡在外面')
+  await page.getByRole('button', { name: '重置' }).last().click()
+  await expect(allow).toContainText('没有设置：不限制来源')
+
+  // 账号白名单：给被授权用户设一条，重新打开能看到；再清空（后面的用例要用这个账号从本机登录）
+  await openMenu(page, '权限管理', '用户管理')
+  await page.getByPlaceholder('账号 / 显示名 / 邮箱').fill(userName)
+  await page.getByPlaceholder('账号 / 显示名 / 邮箱').press('Enter')
+  await page.getByTestId(`user-actions-${userName}`).getByTestId('user-ip-allow').click()
+  const dialog = page.getByTestId('user-ip-dialog')
+  await expect(dialog).toBeVisible()
+  await dialog.getByTestId('ip-add-row').click()
+  await input(page, 'ip-cidr-0').fill('10.9.8.0/24')
+  await page.getByTestId('user-ip-save').click()
+  await expect(dialog).toBeHidden()
+  await page.getByTestId(`user-actions-${userName}`).getByTestId('user-ip-allow').click()
+  await expect(input(page, 'ip-cidr-0')).toHaveValue('10.9.8.0/24')
+  await dialog.getByRole('button', { name: '删除' }).click()
+  await page.getByTestId('user-ip-save').click()
+  await expect(dialog).toBeHidden()
+
+  // 操作日志里有这些动作
+  await openMenu(page, '运维中心', '操作日志')
+  for (const name of ['封禁 IP', '解除 IP 封禁', '设置账号 IP 白名单']) await expect(page.getByTestId('oplog-table')).toContainText(name)
+  await logout(page)
+})
+
+test('超管：代理商、商户管理——开通时初始密码只显示一次，商户挂在代理商下，详情里看账号、重置主账号密码，停用，按编号看日志（D-065、D-066）', async ({ page }) => {
+  const agentName = `E2E代理${stamp}`
+  const merchantName = `E2E商户${stamp}`
+  await login(page, admin, adminPwd)
+  await expect(page).toHaveURL(/\/dashboard\/data-center$/)
+  // 两个目录在工作台之后、运维中心之前（根目录排序 100、110）
+  const order = await page.locator('.ga-sidebar .el-menu-item, .ga-sidebar .el-sub-menu__title').allInnerTexts()
+  const at = (name: string) => order.findIndex((x) => x.includes(name))
+  expect(at('工作台')).toBeLessThan(at('代理商管理'))
+  expect(at('代理商管理')).toBeLessThan(at('商户管理'))
+  expect(at('商户管理')).toBeLessThan(at('运维中心'))
+
+  // 开通代理商：编号 A 加 8 位数字，主账号的初始密码只在这个对话框里出现
+  await openMenu(page, '代理商管理', '代理商列表')
+  await expect(page).toHaveURL(/\/agent\/list$/)
+  // 两个列表页的按钮 data-test 相同：按文字点，切页的过渡动画里不会点到上一页的
+  await page.getByRole('button', { name: '开通代理商' }).click()
+  await input(page, 'org-form-name').fill(agentName)
+  await input(page, 'org-form-owner').fill('boss')
+  await page.getByTestId('org-form-submit').click()
+  const reveal = page.getByTestId('org-password').last()
+  await expect(reveal).toBeVisible()
+  const agentCode = (await reveal.getByTestId('org-password-code').innerText()).trim()
+  expect(agentCode).toMatch(/^A\d{8}$/)
+  const agentPwd = (await reveal.getByTestId('org-password-value').innerText()).trim()
+  expect(agentPwd).toHaveLength(20)
+  await reveal.getByRole('button', { name: '关闭', exact: true }).click()
+  await expect(page.getByTestId('org-table')).toContainText(agentCode)
+  await expect(page.getByTestId('org-table')).not.toContainText(agentPwd)
+
+  // 开通商户，挂在刚才的代理商下
+  await openMenu(page, '商户管理', '商户列表')
+  await expect(page).toHaveURL(/\/merchant\/list$/)
+  await page.getByRole('button', { name: '开通商户' }).click()
+  await input(page, 'org-form-name').fill(merchantName)
+  await page.getByTestId('org-form-agent').click()
+  await page.getByTestId('org-form-agent').locator('input').fill(agentCode)
+  await page.locator('.el-select-dropdown__item:visible', { hasText: agentCode }).click()
+  await input(page, 'org-form-owner').fill('admin')
+  await page.getByTestId('org-form-submit').click()
+  await expect(reveal).toBeVisible()
+  const merchantCode = (await reveal.getByTestId('org-password-code').innerText()).trim()
+  expect(merchantCode).toMatch(/^M\d{8}$/)
+  const firstPwd = (await reveal.getByTestId('org-password-value').innerText()).trim()
+  await reveal.getByRole('button', { name: '关闭', exact: true }).click()
+  const row = page.getByTestId('org-table').locator('tr', { hasText: merchantCode })
+  await expect(row).toContainText(agentName)
+  await expect(row).toContainText('admin')
+
+  // 详情：账号页签里主账号带标记；重置主账号密码，新密码同样只显示一次
+  await page.getByTestId(`org-actions-${merchantCode}`).getByTestId('org-detail-open').click()
+  const drawer = page.getByTestId('org-detail')
+  await expect(drawer).toContainText(merchantCode)
+  await drawer.getByRole('tab', { name: '账号' }).click()
+  await expect(drawer.getByTestId('org-accounts')).toContainText('admin')
+  await expect(drawer.getByTestId('org-accounts')).toContainText('主账号')
+  await drawer.getByTestId('org-reset-owner').click()
+  await page.getByRole('button', { name: '确定' }).click()
+  const reset = page.getByTestId('org-password').last()
+  await expect(reset).toBeVisible()
+  const resetPwd = (await reset.getByTestId('org-password-value').innerText()).trim()
+  expect(resetPwd).toHaveLength(20)
+  expect(resetPwd).not.toBe(firstPwd)
+  await reset.getByRole('button', { name: '关闭', exact: true }).click()
+  // 从详情去这个商户的登录日志：编号已经填好
+  await drawer.getByRole('button', { name: '登录日志' }).click()
+  await expect(page).toHaveURL(new RegExp(`/merchant/login-logs\\?orgCode=${merchantCode}$`))
+  await expect(input(page, 'orglog-code')).toHaveValue(merchantCode)
+  await expect(page.getByTestId('orglog-table')).toBeVisible()
+
+  // 停用商户
+  await openMenu(page, '商户管理', '商户列表')
+  await page.getByTestId(`org-actions-${merchantCode}`).getByTestId('org-toggle').click()
+  await page.getByRole('button', { name: '确定' }).click()
+  await expect(page.getByTestId('org-table').locator('tr', { hasText: merchantCode })).toContainText('停用')
+
+  // 运维中心的安全事件可以选端（D-066）
+  await openMenu(page, '运维中心', '安全事件')
+  await page.getByTestId('ops-portal').click()
+  await page.locator('.el-select-dropdown__item:visible', { hasText: '商户端' }).click()
+  await expect(page.getByTestId('ops-portal')).toContainText('商户端')
+
+  // 平台的操作日志里有这些动作，请求体里没有初始密码
+  await openMenu(page, '运维中心', '操作日志')
+  for (const name of ['开通代理商', '开通商户', '重置商户主账号密码', '启停商户']) await expect(page.getByTestId('oplog-table')).toContainText(name)
+  await expect(page.getByTestId('oplog-table')).not.toContainText(resetPwd)
+  await logout(page)
+})
+
 test('超管：菜单管理——改名、建分组并拖进去后侧边栏立即生效，删除分组和恢复默认后回到原样', async ({ page }) => {
-  // 菜单树变长了（运维中心，D-032）：窗口够高，拖动时源和目标都在视口里，不用边拖边滚动
-  await page.setViewportSize({ width: 1280, height: 1200 })
+  // 菜单树变长了（运维中心 D-032，代理商管理、商户管理 D-066）：窗口够高，拖动时源和目标都在视口里，不用边拖边滚动
+  await page.setViewportSize({ width: 1280, height: 1600 })
   await login(page, admin, adminPwd)
   await expect(page).toHaveURL(/\/dashboard\/data-center$/)
   const sidebar = page.locator('.ga-sidebar')

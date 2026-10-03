@@ -32,7 +32,7 @@ func setupWith(t *testing.T, tweak func(p *conf.Portal)) error {
 	p.JWTSecret = "platform-test-secret-0123456789abcdef0123456789"
 	tweak(&p)
 	cfg.Portals[conf.DefaultPortalCode] = p
-	a, err := app.New(cfg, app.WithDB(gdb), app.WithLogger(logx.New("error", "text", io.Discard)), app.WithBcryptCost(4))
+	a, err := app.New(cfg, app.WithDB(gdb), app.WithLogger(logx.New("error", "text", io.Discard)), app.WithPasswordHashParams(64, 1))
 	require.NoError(t, err)
 	a.Register(system.Module())
 	return a.Setup()

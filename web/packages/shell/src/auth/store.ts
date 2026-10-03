@@ -6,9 +6,11 @@ import { computed, ref } from 'vue'
 import { usePortal } from '../context'
 import { HeaderClient } from '../request/client'
 import { ApiError, Codes } from '../types'
-import type { MeResponse, MeUser, MenuTree, PwdPolicy, TokenResponse } from '../types'
+import type { MeOrg, MeResponse, MeUser, MenuTree, PwdPolicy, TokenResponse } from '../types'
 
 export interface LoginInput {
+  /** 主体编号：主体端（代理商、商户）必填，平台端不传（D-061）。 */
+  org?: string
   username: string
   password: string
   captchaId?: string
@@ -38,7 +40,7 @@ function pendingLogoutKey(): string {
  * 旧名字（不带前缀）的标记在 https 下另外读出来，只作"不恢复"的依据、不作"补做退出"的依据（D-060）：旧版本写
  * localStorage 失败时标记只在旧 Cookie 里，直接忽略的话，没确认退出的会话会被恢复；可它也可能是同主域的其他主机
  * 塞进来的，不能凭它去吊销会话。所以启动时刷新换来的会话在旧标记里，就只清掉本地登录态、不恢复（用户重新登录即可），
- * 不发退出请求；换来的会话不在旧标记里、或刷新被拒，旧标记就没用了，删掉。
+ * 不发退出请求；换来的会话不在旧标记里、或刷新被拒，旧标记就没用了，删掉——刷新在途时又有新会话号写进来的除外（D-069）。
  */
 export function logoutMarkCookieName(portal: string, https: boolean): string {
   return https ? `__Host-ga_lo_${portal}` : `ga_lo_${portal}`
@@ -68,8 +70,14 @@ function readLegacyLogouts(): string[] {
   }
 }
 
-function clearLegacyLogouts(): void {
+/**
+ * 删掉 https 下旧名字的标记，前提是里面的会话号都在 seen（启动时读到的那些）里（D-069）。启动时读、刷新回来才删，中间
+ * 隔着一次网络请求：这期间别的标签页写进来的会话号不在 seen 里，整个删掉就把它也丢了——那个没确认退出的会话以后会被恢复。
+ * 所以只要有 seen 之外的会话号，这次就不删，留到下次启动再判断。不改成"把剩下的写回去"：https 下不往旧名字里写东西（D-060）。
+ */
+function clearLegacyLogouts(seen: string[]): void {
   if (!isHttps()) return
+  if (readLegacyLogouts().some((id) => !seen.includes(id))) return
   try {
     document.cookie = `${logoutMarkCookieName(usePortal().portal, false)}=${cookieAttrs(0)}`
   } catch {
@@ -170,6 +178,8 @@ export const useAuthStore = defineStore('ga.auth', () => {
   const token = ref<string | null>(null)
   const expiresAt = ref(0)
   const user = ref<MeUser | null>(null)
+  /** 主体端：当前账号所属的主体（顶栏显示），平台端为 null。 */
+  const org = ref<MeOrg | null>(null)
   const perms = ref<string[]>([])
   const menus = ref<MenuTree[]>([])
   const pwdPolicy = ref<PwdPolicy | null>(null)
@@ -211,6 +221,7 @@ export const useAuthStore = defineStore('ga.auth', () => {
     }
     expiresAt.value = 0
     user.value = null
+    org.value = null
     perms.value = []
     menus.value = []
     pwdPolicy.value = null
@@ -231,6 +242,7 @@ export const useAuthStore = defineStore('ga.auth', () => {
     const me = await usePortal().client.get<MeResponse>('/auth/me')
     ensureSame(started)
     user.value = me.user
+    org.value = me.org ?? null
     perms.value = me.perms ?? []
     menus.value = me.menus ?? []
     pwdPolicy.value = me.pwdPolicy ?? null
@@ -280,13 +292,14 @@ export const useAuthStore = defineStore('ga.auth', () => {
         return
       }
       // 旧名字标记里的会话（D-060）：不恢复，也不凭它补做退出；旧标记留着，下次启动换来的还是它就照样不恢复
-      if (t.sessionId && legacy.includes(t.sessionId)) {
+      // 刷新在途时别的标签页刚写进旧标记的也算（D-069）：再读一遍，和启动时读到的合起来看
+      if (t.sessionId && (legacy.includes(t.sessionId) || readLegacyLogouts().includes(t.sessionId))) {
         if (epoch.value === started) clear()
         return
       }
       // Cookie 是别的会话：读到的这些在这个浏览器里已经没有凭据，补不了也不需要补
       removePendingLogouts(pending)
-      clearLegacyLogouts()
+      clearLegacyLogouts(legacy)
       await fetchMe()
     } catch (e) {
       const rejected = e instanceof ApiError && e.status === 401
@@ -295,7 +308,7 @@ export const useAuthStore = defineStore('ga.auth', () => {
       // 那个会话可能正是某条待补退出的，不动；网络故障、服务端临时出错时也都留着
       if (rejected && !switched) {
         removePendingLogouts(pending)
-        clearLegacyLogouts()
+        clearLegacyLogouts(legacy)
       }
       if (epoch.value === started) {
         accountSwitched.value = switched
@@ -370,6 +383,7 @@ export const useAuthStore = defineStore('ga.auth', () => {
     accountSwitched,
     expiresAt,
     user,
+    org,
     perms,
     menus,
     pwdPolicy,

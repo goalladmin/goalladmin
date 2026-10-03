@@ -473,7 +473,7 @@ func TestDataScope_60c_SideDoors(t *testing.T) {
 		require.Equal(t, 403, r.rec.Code, r.rec.Body.String())
 		require.Equal(t, "rbac.role.holdsSensitive", fieldKey(r))
 		require.Equal(t, 0, enable(ok).env.Code, "权限和范围都不超过自己的可以")
-		require.Equal(t, 0, f.do(ed, "PUT", fmt.Sprintf("/system/roles/%d", ok), gin.H{"name": "off", "status": 0}).env.Code, "停用总是可以")
+		require.Equal(t, 0, f.do(ed, "PUT", fmt.Sprintf("/system/roles/%d", ok), gin.H{"name": "off", "status": 0}).env.Code, "自己分配得出去的角色可以停用")
 	})
 
 	t.Run("部门负责人只能选范围内的人", func(t *testing.T) {

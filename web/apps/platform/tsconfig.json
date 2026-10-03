@@ -16,5 +16,5 @@
     "types": ["vite/client", "element-plus/global"],
     "baseUrl": "."
   },
-  "include": ["src/**/*.ts", "src/**/*.js", "src/**/*.vue", "src/**/*.d.ts", "vite.config.ts", "build/**/*.ts"]
+  "include": ["src/**/*.ts", "src/**/*.js", "src/**/*.vue", "src/**/*.d.ts", "vite.config.ts"]
 }

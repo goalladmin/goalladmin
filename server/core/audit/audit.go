@@ -56,6 +56,7 @@ const (
 type SecurityEvent struct {
 	ID        uint64    `json:"id"`
 	Portal    string    `json:"portal"`
+	OrgID     uint64    `json:"orgId"` // 主体端：相关账号所属的主体（D-061）；不知道或平台端为 0
 	Kind      string    `json:"kind"`
 	Level     int       `json:"level"`
 	UserID    uint64    `json:"userId"`
@@ -76,6 +77,7 @@ type SecurityEvent struct {
 // Kind 用小写字母、数字、下划线和点（最长 32）；框架认识的类型按固定级别记录，其他类型 Level 为 0 时按警告。
 type NewSecurityEvent struct {
 	Portal    string
+	OrgID     uint64 // 主体端：相关账号所属的主体（D-061）
 	Kind      string
 	Level     int
 	UserID    uint64
@@ -88,6 +90,7 @@ type NewSecurityEvent struct {
 // SecurityFilter 是安全事件的查询条件；零值字段不参与过滤。From、To 按第一次出现的时间过滤。
 type SecurityFilter struct {
 	Portal string
+	OrgID  uint64 // 非 0 时只看这个主体的（D-061）
 	// IncludeGlobal 为 true 时，Portal 之外再包括不属于任何端的事件（例如命令行清理策略）。
 	IncludeGlobal bool
 	Kind          string
@@ -124,12 +127,15 @@ const (
 // Cursor 是上一页返回的 Next，只取排在它后面（更早）的记录；Limit 取 1–200，默认 100。
 // Portal 非空时只看这个端的记录，不属于任何端的安全事件也包括在内。
 type TimelineQuery struct {
-	Portal    string
-	UserID    uint64
-	IP        string
-	SessionID string
-	Cursor    string
-	Limit     int
+	Portal string
+	// IncludeGlobal 为 true 时，安全事件再包括不属于任何端的（同 SecurityFilter.IncludeGlobal）。平台的运维中心看平台端时设它；
+	// 看代理商端、商户端时不设：分不清是哪个程序写的（D-066）
+	IncludeGlobal bool
+	UserID        uint64
+	IP            string
+	SessionID     string
+	Cursor        string
+	Limit         int
 }
 
 // TimelineItem 是时间线上的一条：登录、操作或安全事件。只有对应类型的字段有值。

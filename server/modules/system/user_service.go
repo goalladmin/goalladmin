@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sync"
 	"time"
 
 	"gorm.io/gorm"
@@ -24,6 +25,8 @@ type UserService struct {
 	org  *OrgService
 	// avatarSlots 限制同时处理的头像上传数（D-040）：解码一张大图要几十 MB 内存
 	avatarSlots chan struct{}
+	avatarMu    sync.Mutex
+	avatarUsers map[uint64]bool
 }
 
 // 同时处理的头像上传数上限。
@@ -31,7 +34,7 @@ const avatarConcurrency = 2
 
 // NewUserService 创建服务。
 func NewUserService(deps *app.Deps, repo *UserRepo, org *OrgService) *UserService {
-	return &UserService{deps: deps, repo: repo, org: org, avatarSlots: make(chan struct{}, avatarConcurrency)}
+	return &UserService{deps: deps, repo: repo, org: org, avatarSlots: make(chan struct{}, avatarConcurrency), avatarUsers: map[uint64]bool{}}
 }
 
 // UserView 是对外的用户视图（不含密码哈希）。
@@ -262,6 +265,12 @@ type CreateInput struct {
 
 // Create 创建用户：密码由管理员提供或系统生成，下次登录必须改密。返回生成的初始密码（管理员提供时为空）。
 func (s *UserService) Create(ctx context.Context, actor auth.Principal, in CreateInput) (*UserView, string, error) {
+	if len(in.PostIDs) > maxUserPosts {
+		return nil, "", httpx.ErrValidation.WithFields(httpx.NewField("postIds", "system.user.posts", "at most 20 posts", "max", maxUserPosts))
+	}
+	if len(in.RoleIDs) > rbac.MaxRolesPerUser {
+		return nil, "", httpx.ErrValidation.WithFields(httpx.NewField("roleIds", "validation.max", "too many roles", "param", rbac.MaxRolesPerUser))
+	}
 	in.Username = portal.NormalizeUsername(in.Username)
 	if !ValidUsername(in.Username) {
 		return nil, "", httpx.ErrValidation.WithFields(httpx.NewField("username", "system.user.username", "3-64 chars: lowercase letters, digits, '_', '.', '-', starting with a letter"))
@@ -277,10 +286,6 @@ func (s *UserService) Create(ctx context.Context, actor auth.Principal, in Creat
 	} else if err := s.deps.Auth.ValidatePassword(PortalCode, plain, in.Username); err != nil {
 		return nil, "", err
 	}
-	hash, err := s.deps.Auth.HashPassword(PortalCode, plain)
-	if err != nil {
-		return nil, "", err
-	}
 	if in.DisplayName == "" {
 		in.DisplayName = in.Username
 	}
@@ -290,6 +295,11 @@ func (s *UserService) Create(ctx context.Context, actor auth.Principal, in Creat
 		return nil, "", err
 	}
 	in.DisplayName = name
+	// 字段校验都过了再算哈希（D-068）：密码哈希慢，和登录核对密码占同一个并发上限，满了回 429
+	hash, err := s.deps.Auth.HashPassword(PortalCode, plain)
+	if err != nil {
+		return nil, "", err
+	}
 	u := &User{
 		Username: in.Username, PasswordHash: hash, DisplayName: in.DisplayName, Email: in.Email, Phone: in.Phone,
 		MustChangePwd: true, Status: StatusEnabled, Sort: in.Sort, Remark: in.Remark,
@@ -355,6 +365,9 @@ type UpdateInput struct {
 
 // Update 更新资料和部门、岗位（不含密码、状态、角色）。
 func (s *UserService) Update(ctx context.Context, actor auth.Principal, id uint64, in UpdateInput) (*UserView, error) {
+	if in.PostIDs != nil && len(*in.PostIDs) > maxUserPosts {
+		return nil, httpx.ErrValidation.WithFields(httpx.NewField("postIds", "system.user.posts", "at most 20 posts", "max", maxUserPosts))
+	}
 	if in.DisplayName == "" {
 		return nil, httpx.ErrValidation.WithFields(httpx.NewField("displayName", "validation.required", "required"))
 	}
@@ -389,6 +402,23 @@ func (s *UserService) Update(ctx context.Context, actor auth.Principal, id uint6
 			if err := s.checkNewDept(ctx, actor, PermUserUpdate, *in.DeptID); err != nil {
 				return err
 			}
+			for _, d := range s.deps.RBAC.DataResources(PortalCode) {
+				if d.Code != DataUser {
+					continue
+				}
+				for _, perm := range d.Perms {
+					f, err := s.deps.RBAC.DataFilterLocked(ctx, actor, DataUser, perm)
+					if err != nil {
+						return err
+					}
+					if !f.All() && f.Allows(u.DeptID, id) != f.Allows(*in.DeptID, id) {
+						return httpx.ErrForbidden.WithFields(httpx.NewField("deptId", "system.user.deptOutOfScope", "moving the account would cross a data scope boundary"))
+					}
+				}
+			}
+			if err := s.deps.RBAC.CheckUserDepartment(ctx, actor, id, *in.DeptID); err != nil {
+				return err
+			}
 		}
 		if err := s.repo.Update(ctx, id, map[string]any{
 			"display_name": in.DisplayName, "email": in.Email, "phone": in.Phone, "bio": in.Bio, // 头像不在这里改（D-040）
@@ -396,12 +426,15 @@ func (s *UserService) Update(ctx context.Context, actor auth.Principal, id uint6
 		}); err != nil {
 			return err
 		}
-		return s.org.assignOrg(ctx, u, in.DeptID, in.PostIDs)
+		if err := s.org.assignOrg(ctx, u, in.DeptID, in.PostIDs); err != nil {
+			return err
+		}
+		db.AfterCommit(ctx, func() { s.deps.Auth.ForgetAccount(PortalCode, id) })
+		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	s.deps.Auth.ForgetAccount(PortalCode, id)
 	return s.viewAfterWrite(ctx, actor, id)
 }
 
@@ -485,9 +518,16 @@ func (s *UserService) ResetPassword(ctx context.Context, actor auth.Principal, i
 	if !actor.Super {
 		return "", httpx.ErrForbidden
 	}
-	var plain string
+	// 目标不存在的请求不去算哈希；哈希在拿超管锁之前算好，不在锁里等它（D-068）。锁内照样认定
+	if _, err := s.repo.FindByID(ctx, id); err != nil {
+		return "", notFound(err)
+	}
+	plain, hash, err := newPassword(s.deps)
+	if err != nil {
+		return "", err
+	}
 	// 判断"不是超管"和换密码在同一把超管锁里：同时被提升为超管的账号不会在网页上被重置
-	err := s.deps.RBAC.WithActor(ctx, actor, func(ctx context.Context, actor auth.Principal) error {
+	err = s.deps.RBAC.WithActor(ctx, actor, func(ctx context.Context, actor auth.Principal) error {
 		u, err := s.repo.FindByID(ctx, id)
 		if err != nil {
 			return notFound(err)
@@ -502,8 +542,7 @@ func (s *UserService) ResetPassword(ctx context.Context, actor auth.Principal, i
 		if super {
 			return httpx.ErrForbidden.WithFields(httpx.NewField("id", "system.user.resetSuper", "a super administrator's password can only be reset on the server command line (admin reset-password)"))
 		}
-		plain, err = resetPassword(ctx, s.deps, s.repo, u.ID)
-		return err
+		return setPassword(ctx, s.deps, s.repo, u.ID, hash)
 	})
 	if err != nil {
 		return "", err
@@ -511,18 +550,21 @@ func (s *UserService) ResetPassword(ctx context.Context, actor auth.Principal, i
 	return plain, nil
 }
 
-// resetPassword 换成随机密码并要求下次登录改密；写密码和吊销会话是一个事务：吊销失败时密码也不会换掉，
+// newPassword 生成随机密码并算好哈希（慢：调用方在拿锁之前调；和登录核对密码占同一个并发上限，满了回 429，D-068）。
+func newPassword(deps *app.Deps) (plain, hash string, err error) {
+	if plain, err = deps.Auth.GeneratePassword(); err != nil {
+		return "", "", err
+	}
+	if hash, err = deps.Auth.HashPassword(PortalCode, plain); err != nil {
+		return "", "", err
+	}
+	return plain, hash, nil
+}
+
+// setPassword 把密码换成 hash 并要求下次登录改密；写密码和吊销会话是一个事务：吊销失败时密码也不会换掉，
 // 不会出现"密码已改、没人知道新密码、旧会话还在"的状态。网页上的重置和命令行共用。
-func resetPassword(ctx context.Context, deps *app.Deps, repo *UserRepo, id uint64) (string, error) {
-	plain, err := deps.Auth.GeneratePassword()
-	if err != nil {
-		return "", err
-	}
-	hash, err := deps.Auth.HashPassword(PortalCode, plain)
-	if err != nil {
-		return "", err
-	}
-	err = db.Tx(ctx, func(ctx context.Context) error {
+func setPassword(ctx context.Context, deps *app.Deps, repo *UserRepo, id uint64, hash string) error {
+	return db.Tx(ctx, func(ctx context.Context) error {
 		if err := repo.UpdatePasswordHash(ctx, id, hash, true); err != nil {
 			return err
 		}
@@ -533,10 +575,6 @@ func resetPassword(ctx context.Context, deps *app.Deps, repo *UserRepo, id uint6
 		db.AfterCommit(ctx, func() { deps.Auth.ForgetAccount(PortalCode, id) })
 		return nil
 	})
-	if err != nil {
-		return "", err
-	}
-	return plain, nil
 }
 
 // RevokeSession 让本端的一个会话下线；非超管不能让超管的会话下线（D-035）。

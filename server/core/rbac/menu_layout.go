@@ -4,7 +4,7 @@ package rbac
 //
 //   - 代码声明的菜单（路径、页面组件、权限码、所属端）后台不能改；能改的是显示名、图标、在侧边栏隐藏、上级和排序。
 //   - 后台可以新建分组：纯目录，没有路径、页面和权限码，分组名由服务端生成（@g- 开头）。
-//   - 可见性仍只由权限码决定：一个菜单要求的权限码 = 它自己的权限码 + 代码里所有祖先的权限码，与它现在挪到哪里无关；
+//   - 可见性由权限码和主账号条件决定，均沿代码祖先继承：一个菜单要求的权限码 = 它自己的权限码 + 代码里所有祖先的权限码，与它现在挪到哪里无关；
 //     带权限码的目录（及其代码子孙）只能装它在代码里本来的子孙，否则挪进去的菜单会被多要求一个权限码而消失。
 //   - ga_menu_custom 只存"与代码不同的部分"；代码删掉的菜单，它的覆盖行自动失效。
 //   - 所有写操作在一个事务里先读后写，并由进程内互斥串行化（v0.1 只支持单实例，规范 §6.3）。
@@ -127,7 +127,7 @@ func accepts(p, c *layoutNode) bool {
 	if !c.Group && c.def.Parent == p.Name {
 		return true
 	}
-	return p.container() && needs(p.need, c.need)
+	return p.container() && (!p.SuperOnly || c.SuperOnly) && needs(p.need, c.need)
 }
 
 // container 报告节点能不能装子节点：分组，或没有页面组件的代码菜单。
@@ -165,8 +165,19 @@ func (s *Service) menuCustomCached(ctx context.Context, portal string) ([]menuCu
 
 // menuChanged 在写入提交后调用：清缓存（Delete 会让缓存的失效代数加一，正在读库的读方不会回填旧数据）。
 func (s *Service) menuChanged(portal string) {
+	s.InvalidateMenu(portal)
+	if s.onMenuChange != nil {
+		s.onMenuChange(portal)
+	}
+}
+
+// InvalidateMenu 清某端的菜单缓存，不读库、不再次通知（D-075）。
+func (s *Service) InvalidateMenu(portal string) {
 	s.menuCache.Delete(portal)
 }
+
+// InvalidateAllMenus 清全部端的菜单缓存，订阅建立或恢复时调用。
+func (s *Service) InvalidateAllMenus() { s.menuCache.Flush() }
 
 // parseTitles 解析存储的显示名；坏数据当作没有。
 func parseTitles(raw string) map[string]string {
@@ -220,6 +231,7 @@ func resolveLayout(code []MenuNode, rows []menuCustom) []*layoutNode {
 		seen := map[string]bool{}
 		for c, ok := codeByName[n.Name], true; ok && !seen[c.Name]; c, ok = codeByName[c.Parent] {
 			seen[c.Name] = true
+			n.SuperOnly = n.SuperOnly || c.SuperOnly
 			if c.Perm != "" {
 				n.need = append(n.need, c.Perm)
 			}
@@ -290,7 +302,7 @@ func (s *Service) layout(ctx context.Context, portal string) ([]*layoutNode, err
 // buildTree 把生效节点组装成树并按可见性裁剪（规范 §6.6）：
 // 每个节点先看 need（自己和代码祖先的权限码）是否都具备；页面满足就可见，不看子节点；
 // 目录和分组还要有至少一个可见的子节点；代码目录的子节点全被挪走、或分组是空的，不显示。
-func buildTree(nodes []*layoutNode, visible func(perm string) bool) []*MenuTree {
+func buildTree(nodes []*layoutNode, visible func(perm string) bool, super bool) []*MenuTree {
 	children := map[string][]*layoutNode{}
 	var roots []*layoutNode
 	for _, n := range nodes {
@@ -302,6 +314,9 @@ func buildTree(nodes []*layoutNode, visible func(perm string) bool) []*MenuTree 
 	}
 	var build func(n *layoutNode) *MenuTree
 	build = func(n *layoutNode) *MenuTree {
+		if n.SuperOnly && !super {
+			return nil
+		}
 		t := &MenuTree{
 			Name: n.Name, Path: n.Path, Component: n.Component, TitleKey: n.TitleKey, Titles: n.Titles,
 			Icon: n.Icon, KeepAlive: n.KeepAlive, Hidden: n.Hidden, Sort: n.Sort,
@@ -473,8 +488,13 @@ func validSort(v int) bool { return v >= 0 && v <= MaxMenuSort }
 
 // menuTx 在事务里、持有互斥时执行菜单写操作：读出（并锁住）该端的调整行，算出生效节点，交给 fn；
 // 提交后清掉该端的缓存。操作人在超管锁里重新认定（D-047），加锁顺序固定为"菜单互斥 → 超管锁"。
+//
+// 菜单调整按端存、对全端生效。主体端的身份（哪怕是主账号）一律不能改：改了就影响到所有别的主体（D-063 第 8 条）。
 func (s *Service) menuTx(ctx context.Context, actor auth.Principal, fn func(ctx context.Context, nodes []*layoutNode, byName map[string]*layoutNode) error) error {
 	portal := actor.Portal
+	if _, scoped := s.scopedPortal(portal); scoped || actor.OrgID != 0 {
+		return httpx.ErrForbidden.WithCause(fmt.Errorf("rbac: 主体端 %s 的菜单调整对全端生效，主体内不能修改", portal))
+	}
 	s.menuMu.Lock()
 	defer s.menuMu.Unlock()
 	return s.WithActor(ctx, actor, func(ctx context.Context, _ auth.Principal) error {

@@ -1,7 +1,7 @@
 {
   "name": "goalladmin-web",
   "private": true,
-  "description": "GoAllAdmin 前端工作区：packages/shell 是框架壳，apps/<portal> 是各端应用",
+  "description": "GoAllAdmin 前端工作区：packages/shell 是三个端共用的框架壳，apps/<端> 是各端应用（platform、agent、merchant，D-064）",
   "packageManager": "pnpm@10.28.0",
   "engines": {
     "node": ">=22"
@@ -16,6 +16,8 @@
     "test": "npm run test --workspaces --if-present",
     "build": "npm run build --workspaces --if-present",
     "dev": "npm run dev -w @ga/platform",
+    "dev:agent": "npm run dev -w @ga/agent",
+    "dev:merchant": "npm run dev -w @ga/merchant",
     "e2e": "npm run e2e -w @ga/platform"
   }
 }

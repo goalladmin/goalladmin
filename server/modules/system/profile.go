@@ -7,6 +7,7 @@ import (
 	"unicode"
 
 	"github.com/goalladmin/goalladmin/server/core/auth"
+	"github.com/goalladmin/goalladmin/server/core/db"
 	"github.com/goalladmin/goalladmin/server/core/httpx"
 )
 
@@ -98,13 +99,13 @@ func (s *UserService) UpdateProfile(ctx context.Context, p auth.Principal, in Pr
 		}); err != nil {
 			return notFound(err)
 		}
+		// 显示名进了账号状态缓存；外层事务成功提交后再清除并通知。
+		db.AfterCommit(ctx, func() { s.deps.Auth.ForgetAccount(p.Portal, p.UserID) })
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	// 显示名进了账号状态缓存，清掉让 /auth/me 立即看到新值
-	s.deps.Auth.ForgetAccount(p.Portal, p.UserID)
 	return s.Profile(ctx, p)
 }
 

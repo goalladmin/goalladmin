@@ -27,6 +27,7 @@ const (
 
 	CodeForbidden         = 2001 // 无权限
 	CodePwdChangeRequired = 2002 // 必须先修改密码
+	CodeIPDenied          = 2003 // 当前 IP 不允许访问：黑名单或白名单（D-062）
 
 	CodeValidation = 3001 // 参数校验失败，data.fields 给出明细
 	CodeBadRequest = 3002 // 请求体无法解析
@@ -54,6 +55,7 @@ var messages = map[int]map[string]string{
 	CodeSessionLocked:     {LangZH: "屏幕已锁定，请先解锁", LangEN: "screen locked; unlock first"},
 	CodeForbidden:         {LangZH: "没有权限执行此操作", LangEN: "permission denied"},
 	CodePwdChangeRequired: {LangZH: "请先修改密码", LangEN: "password change required"},
+	CodeIPDenied:          {LangZH: "当前 IP 不允许访问", LangEN: "access from this IP address is not allowed"},
 	CodeValidation:        {LangZH: "参数校验失败", LangEN: "validation failed"},
 	CodeBadRequest:        {LangZH: "请求格式错误", LangEN: "malformed request"},
 	CodeConflict:          {LangZH: "资源已存在或状态冲突", LangEN: "resource conflict"},
@@ -115,7 +117,7 @@ func StatusOf(code int) int {
 		return http.StatusLocked
 	case code >= 1000 && code < 2000:
 		return http.StatusOK // 登录失败等业务性失败
-	case code == CodeForbidden, code == CodePwdChangeRequired:
+	case code == CodeForbidden, code == CodePwdChangeRequired, code == CodeIPDenied:
 		return http.StatusForbidden
 	case code >= 2000 && code < 3000:
 		return http.StatusForbidden

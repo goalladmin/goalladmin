@@ -96,6 +96,8 @@ async function logout() {
     <button type="button" class="ga-topbar__btn" :title="t('shell.lock.lock')" data-test="lock-screen" @click="lock">
       <el-icon><Lock /></el-icon>
     </button>
+    <!-- 主体端：当前账号所属的主体（D-067） -->
+    <span v-if="auth.org && !layout.isMobile" class="ga-topbar__org" :title="auth.org.code" data-test="topbar-org">{{ auth.org.name || auth.org.code }}</span>
     <el-dropdown trigger="click">
       <span class="ga-topbar__user">
         <GaAvatar :size="30" :value="auth.user?.avatar" :name="auth.user?.username" />

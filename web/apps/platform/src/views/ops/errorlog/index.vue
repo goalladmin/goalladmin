@@ -1,22 +1,25 @@
 <script setup lang="ts">
-// 错误日志（D-032）：服务端故障按类合并，只读。调用栈要单独的权限。
+// 错误日志（D-032）：服务端故障按类合并，只读。调用栈要单独的权限。可以选看代理商端、商户端的（D-066）。
 import { ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { formatTime, hasPerm, useI18n, useTable } from '@ga/shell'
 
+import PortalSelect from '../../../components/PortalSelect.vue'
 import { logApi } from '../../../api/system'
 import type { ErrorLog } from '../../../api/system'
+import type { OpsPortal } from '../../../api/partner'
 
 const { t } = useI18n()
 
 interface Q extends Record<string, unknown> {
+  portal: OpsPortal
   kind: string
   route: string
   range: [string, string] | null
 }
 
 const table = useTable<Q, ErrorLog>({
-  query: { kind: '', route: '', range: null },
+  query: { portal: 'platform', kind: '', route: '', range: null },
   fetch: ({ range, ...rest }) =>
     logApi.errors({ ...rest, from: range?.[0] ? new Date(range[0]).toISOString() : undefined, to: range?.[1] ? new Date(range[1]).toISOString() : undefined }),
 })
@@ -54,6 +57,9 @@ async function copy(text: string) {
     <el-alert :title="t('ops.errorlog.hint')" type="info" :closable="false" show-icon />
     <el-card>
       <el-form class="ga-toolbar" :inline="true" @submit.prevent="table.search()">
+        <el-form-item :label="t('ops.portal.label')">
+          <PortalSelect v-model="table.query.portal" @update:model-value="table.search()" />
+        </el-form-item>
         <el-form-item :label="t('ops.errorlog.kind')">
           <el-select v-model="table.query.kind" clearable :placeholder="t('common.all')" style="width: 130px">
             <el-option value="panic" :label="t('ops.errorlog.kindPanic')" />
@@ -61,7 +67,7 @@ async function copy(text: string) {
           </el-select>
         </el-form-item>
         <el-form-item :label="t('ops.errorlog.route')">
-          <el-input v-model="table.query.route" clearable placeholder="/api/platform/v1/system" style="width: 240px" @keyup.enter="table.search()" />
+          <el-input v-model="table.query.route" clearable :placeholder="`/api/${table.query.portal}/v1`" style="width: 240px" @keyup.enter="table.search()" />
         </el-form-item>
         <el-form-item :label="t('ops.errorlog.lastAt')">
           <el-date-picker v-model="table.query.range" type="datetimerange" :start-placeholder="t('common.from')" :end-placeholder="t('common.to')" style="width: 340px" />

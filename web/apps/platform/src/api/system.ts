@@ -164,6 +164,43 @@ export const userApi = {
   options: () => useRequest().get<{ id: number; displayName: string }[]>('/system/options/users'),
   /** 管理员只能清除别人的头像（D-040）。 */
   clearAvatar: (id: number) => useRequest().delete<null>(`/system/users/${id}/avatar`),
+  /** 账号的 IP 白名单（D-062）。字段错误由对话框自己显示（silent）。 */
+  ipAllow: (id: number) => useRequest().get<IPAllowView>(`/system/users/${id}/ip-allow`),
+  setIPAllow: (id: number, items: IPEntry[]) => useRequest().put<IPAllowView>(`/system/users/${id}/ip-allow`, { items }, { silent: true }),
+}
+
+// ---- IP 访问控制（docs/decisions.md D-062） ----
+
+/** 一条 IP 规则。黑名单有到期时间（null 为永久）。 */
+export interface IPRule {
+  id: number
+  cidr: string
+  expiresAt: string | null
+  remark: string
+  createdBy: number
+  createdAt: string
+  updatedAt: string
+}
+
+/** 白名单的一条：单个地址或网段，加备注。 */
+export interface IPEntry {
+  cidr: string
+  remark: string
+}
+
+/** 一份白名单，连同调用者当前的地址（设名单时不要漏了它）。 */
+export interface IPAllowView {
+  items: IPRule[]
+  yourIp: string
+}
+
+export const ipApi = {
+  denyList: (params: PageQuery & { includeExpired?: number }) => useRequest().get<PageData<IPRule>>('/system/ip-rules/deny', { params }),
+  /** expiresIn 是分钟，0 为永久。字段错误由对话框自己显示（silent）。 */
+  addDeny: (input: { cidr: string; expiresIn: number; remark: string }) => useRequest().post<IPRule>('/system/ip-rules/deny', input, { silent: true }),
+  removeDeny: (id: number) => useRequest().delete<null>(`/system/ip-rules/deny/${id}`),
+  allow: () => useRequest().get<IPAllowView>('/system/ip-rules/allow'),
+  setAllow: (items: IPEntry[]) => useRequest().put<IPAllowView>('/system/ip-rules/allow', { items }, { silent: true }),
 }
 
 export const roleApi = {
@@ -232,6 +269,8 @@ export interface ErrorLog {
 }
 
 export interface ErrorLogQuery extends PageQuery {
+  /** 端（D-066）：不传是平台端。 */
+  portal?: string
   kind?: string
   route?: string
   from?: string
@@ -259,6 +298,8 @@ export interface SecurityEvent {
 }
 
 export interface SecurityEventQuery extends PageQuery {
+  /** 端（D-066）：不传是平台端。 */
+  portal?: string
   kind?: string
   level?: number
   userId?: number
@@ -284,6 +325,7 @@ export const securityKinds = [
   'login_rate_limited',
   'unlock_exhausted',
   'pwd_change_throttled',
+  'ip_denied',
   'cli',
 ] as const
 
@@ -314,6 +356,8 @@ export interface TimelineItem {
 }
 
 export interface TimelineQuery {
+  /** 端（D-066）：不传是平台端；用户 ID 只在一个端里有意义。 */
+  portal?: string
   userId?: number
   ip?: string
   sessionId?: string
@@ -573,22 +617,8 @@ export const menuApi = {
 
 const tz = () => -new Date().getTimezoneOffset()
 
-export interface DashboardData {
-  /** 连续的本地日期，最后一天是今天。 */
-  days: string[]
-  users: { total: number; enabled: number; new: number }
-  /** 每天新建的用户数，与 days 对齐。 */
-  newUsers: number[]
-  sessions: number
-  logins: { success: number[]; failed: number[] }
-  operations: number[]
-  reasons: { reason: string; count: number }[]
-  topActions: { action: string; count: number }[]
-  /** 期间操作最多的人。 */
-  topUsers: { userId: number; username: string; count: number }[]
-  /** 按本地钟点（下标 0–23）的成功登录和操作次数。 */
-  hours: { logins: number[]; operations: number[] }
-}
+export type { DashboardData } from '@ga/shell'
+import type { DashboardData } from '@ga/shell'
 
 export interface MonitorSecurity {
   /** 24 个 UTC 整点，最后一个是当前小时。 */

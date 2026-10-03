@@ -572,3 +572,21 @@ describe('logoutMarkCookieName (D-059)', () => {
     expect(logoutMarkCookieName('p', false)).toBe('ga_lo_p')
   })
 })
+
+describe('auth store: 主体端的主体（D-067）', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+  })
+
+  it('取自 /auth/me 的 org，退出（clear）时清掉；平台端为 null', async () => {
+    const client = fakeClient(true)
+    ;(client.get as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ...me, org: { code: 'A12345678', name: '华东代理' } })
+    const auth = useAuthStore()
+    await auth.fetchMe()
+    expect(auth.org).toEqual({ code: 'A12345678', name: '华东代理' })
+    auth.clear()
+    expect(auth.org).toBeNull()
+    await auth.fetchMe()
+    expect(auth.org).toBeNull()
+  })
+})

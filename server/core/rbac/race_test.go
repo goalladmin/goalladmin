@@ -53,7 +53,7 @@ func TestReload_ConcurrentReloadKeepsLatestState(t *testing.T) {
 	require.NoError(t, s.st.replaceRolePerms(ctx, "platform", r.ID, []string{"m:thing:list"}))
 	require.NoError(t, s.st.replaceUserRoles(ctx, "platform", uid, []uint64{r.ID}))
 	require.NoError(t, s.Reload())
-	require.Len(t, s.snap.Load().enabledRoles("platform", uid), 1)
+	require.Len(t, s.snap.Load().enabledRoles("platform", 0, uid), 1)
 
 	// A 读完库（旧状态：uid 有 ops）停在钩子里；这时撤掉 uid 的角色并发起 B 的重载
 	bDone := make(chan error, 1)
@@ -70,7 +70,7 @@ func TestReload_ConcurrentReloadKeepsLatestState(t *testing.T) {
 	require.NoError(t, s.Reload())
 	require.NoError(t, <-bDone) // 等 B 结束再摘钩子，B 在锁里也会读一次钩子
 	s.testHook = nil
-	require.Empty(t, s.snap.Load().enabledRoles("platform", uid), "撤销后的状态不能被先读到旧数据的重载盖回去")
+	require.Empty(t, s.snap.Load().enabledRoles("platform", 0, uid), "撤销后的状态不能被先读到旧数据的重载盖回去")
 }
 
 // 撤销角色、停用角色提交之后，新的判定立即看不到它（D-053：成员关系和角色状态在授权快照里，提交之后重新发布）。
@@ -133,7 +133,7 @@ func TestUserRolesBatch_FillsEveryColumn(t *testing.T) {
 	s, ctx, _ := newRaceService(t)
 	r := createRaceRole(t, ctx, s, "ops")
 	require.NoError(t, s.st.replaceUserRoles(ctx, "platform", 7, []uint64{r.ID}))
-	super, err := s.st.roleByCode(ctx, "platform", SuperRoleCode)
+	super, err := s.st.roleByCode(ctx, "platform", 0, SuperRoleCode)
 	require.NoError(t, err)
 	require.NoError(t, s.st.replaceUserRoles(ctx, "platform", 8, []uint64{super.ID}))
 
@@ -218,7 +218,7 @@ func TestAssign_LockedReadsSeePastSnapshot(t *testing.T) {
 	var assignErr error
 	err := db.Tx(ctx, func(txCtx context.Context) error {
 		// 先做一次普通读，让事务的快照建立在超管收回权限之前
-		_, err := s.st.role(txCtx, "platform", mgr.ID)
+		_, err := s.st.role(txCtx, "platform", 0, mgr.ID)
 		require.NoError(t, err)
 		// 超管在事务外收回 carol 的 edit 并提交（另一条连接）
 		require.NoError(t, s.GrantRolePerms(ctx, root, "platform", mgr.ID, []string{"m:thing:list"}))
@@ -236,7 +236,7 @@ func TestAssign_LockedReadsSeePastSnapshot(t *testing.T) {
 	require.NoError(t, s.reg.AddPerms("m", []Perm{{Code: "m:thing:admin", Name: "admin", Portal: "platform", Group: "m.thing", Sensitive: true}}))
 	require.NoError(t, s.GrantRolePerms(ctx, root, "platform", mgr.ID, []string{"m:thing:list", "m:thing:edit"}))
 	err = db.Tx(ctx, func(txCtx context.Context) error {
-		_, err := s.st.role(txCtx, "platform", target.ID)
+		_, err := s.st.role(txCtx, "platform", 0, target.ID)
 		require.NoError(t, err)
 		require.NoError(t, s.GrantRolePerms(ctx, root, "platform", target.ID, []string{"m:thing:edit", "m:thing:admin"}))
 		assignErr = s.AssignUserRoles(txCtx, carol, "platform", 44, []uint64{target.ID})
@@ -276,7 +276,7 @@ func TestAssign_WildcardRoleNeedsSuper(t *testing.T) {
 // makeSuper 把用户设成超管：Principal 上的 Super 只是认证时的结论，锁内的判断按库里的角色算（D-045）。
 func makeSuper(t *testing.T, ctx context.Context, s *Service, userID uint64) {
 	t.Helper()
-	super, err := s.st.roleByCode(ctx, "platform", SuperRoleCode)
+	super, err := s.st.roleByCode(ctx, "platform", 0, SuperRoleCode)
 	require.NoError(t, err)
 	require.NoError(t, s.st.replaceUserRoles(ctx, "platform", userID, []uint64{super.ID}))
 }
@@ -398,7 +398,7 @@ func TestPolicy_91_MembershipInSameSnapshot(t *testing.T) {
 	ok, err = s.Allowed(ctx, "platform", uid, "m:thing:edit")
 	require.NoError(t, err)
 	require.False(t, ok)
-	require.Len(t, s.snap.Load().enabledRoles("platform", uid), 1)
+	require.Len(t, s.snap.Load().enabledRoles("platform", 0, uid), 1)
 }
 
 // 规范 §13.2 第 91 条：进程外的改动（命令行建管理员、直接改库）不经过本进程的写入，快照过了有效期后下一次判定就重新读库。

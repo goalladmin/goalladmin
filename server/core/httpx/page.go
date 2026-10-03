@@ -3,6 +3,7 @@ package httpx
 import (
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -85,4 +86,17 @@ func atoi(s string, def int) int {
 		return def
 	}
 	return n
+}
+
+// ParseTime 解析请求里的 RFC 3339 时间（D-099）。除了格式，还要求换算成 UTC 后年份在 1–9999 之间：
+// 带时区偏移的时间换算后可能超出这个范围，数据库驱动不接受这样的值。不合规时 ok 为 false。
+func ParseTime(s string) (t time.Time, ok bool) {
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return time.Time{}, false
+	}
+	if y := t.UTC().Year(); y < 1 || y > 9999 {
+		return time.Time{}, false
+	}
+	return t, true
 }

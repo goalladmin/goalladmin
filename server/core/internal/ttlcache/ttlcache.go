@@ -1,5 +1,5 @@
 // Package ttlcache 是一个带过期时间的进程内缓存，供认证链路缓存会话和账号状态。
-// v0.1 单实例；多实例需要 Redis 时替换实现。
+// 配了 Redis 时仍使用本地内存，由失效通知和 TTL 共同保持新鲜（D-075）。
 package ttlcache
 
 import (
@@ -80,12 +80,47 @@ func (c *Cache[V]) SetIfGen(key string, val V, gen uint64) bool {
 	return true
 }
 
+// UpdateIfGen 换掉一项的值、不动它的过期时间：这一项还在、没过期，并且取 gen 之后没有发生过 Delete / Flush 时才写，
+// 返回是否写入。用在"顺手改一下缓存里的值"的场合（D-097）：用 SetIfGen 的话过期时间会重新算，
+// 一条本该到期的旧状态就多活一个周期。
+func (c *Cache[V]) UpdateIfGen(key string, val V, gen uint64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.gen != gen {
+		return false
+	}
+	e, ok := c.items[key]
+	if !ok || c.now().After(e.expires) {
+		return false
+	}
+	c.items[key] = entry[V]{val: val, expires: e.expires}
+	return true
+}
+
 // Delete 删除一项。
 func (c *Cache[V]) Delete(key string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.items, key)
 	c.gen++
+}
+
+// Drop 删除一项，返回它原来在不在。和 Delete 的区别：这一项本来就不在（或已过期）时什么都不做，代数不变。
+// 用在"读到的状态和缓存里的不一样，把缓存里那条去掉"这种场合——调用方自己刚读过库，不是在宣布一次失效；
+// 条目不在时也加代数的话，反复触发它的请求会让别的请求读到的状态一直写不回缓存。
+func (c *Cache[V]) Drop(key string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.items[key]
+	if !ok {
+		return false
+	}
+	delete(c.items, key)
+	if c.now().After(e.expires) {
+		return false
+	}
+	c.gen++
+	return true
 }
 
 // Flush 清空。

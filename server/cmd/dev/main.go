@@ -2,6 +2,8 @@
 // 只在开发机上用（make dev），不进服务二进制；用轮询而不是文件系统事件，不引入第三方依赖。
 //
 //	go run ./cmd/dev [传给服务的参数，如 serve -config config/config.yaml]
+//
+// 默认编译平台程序（server/ 根包）；环境变量 GA_DEV_PKG 指定别的程序，如 GA_DEV_PKG=./cmd/merchant（D-061）。
 package main
 
 import (
@@ -29,8 +31,17 @@ func main() {
 	if len(args) == 0 {
 		args = []string{"serve"}
 	}
-	bin := filepath.Join(os.TempDir(), fmt.Sprintf("goalladmin-dev-%d", os.Getpid()))
-	defer func() { _ = os.Remove(bin) }()
+	pkg := os.Getenv("GA_DEV_PKG")
+	if pkg == "" {
+		pkg = "."
+	}
+	workdir, err := os.MkdirTemp("", "goalladmin-dev-")
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "创建开发构建目录失败: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() { _ = os.RemoveAll(workdir) }()
+	bin := filepath.Join(workdir, "server")
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
@@ -43,7 +54,7 @@ func main() {
 	restart := func() {
 		say("编译中……")
 		next := bin + ".next"
-		build := exec.CommandContext(ctx, "go", "build", "-o", next, ".") //nolint:gosec // 开发工具：编译当前目录
+		build := exec.CommandContext(ctx, "go", "build", "-o", next, pkg) //nolint:gosec // 开发工具：编译开发者指定的本仓库程序
 		build.Stdout, build.Stderr = os.Stdout, os.Stderr
 		if err := build.Run(); err != nil {
 			_ = os.Remove(next)

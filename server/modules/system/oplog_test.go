@@ -164,3 +164,67 @@ func TestOplog_ListEndpointsAndPerms(t *testing.T) {
 		}
 	}
 }
+
+// 179（D-095）：JSON 接口只收声明成 JSON 的请求体。类型不对的请求不执行，操作日志里也不出现请求体里的密码。
+func TestOplog_179_NonJSONContentTypeIsRejectedAndNotLogged(t *testing.T) {
+	f := newFixture(t)
+	admin, _ := f.admin("root")
+	send := func(method, path, contentType, body string) (*httptest.ResponseRecorder, string) {
+		req := httptest.NewRequest(method, base+path, strings.NewReader(body))
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
+		}
+		req.Header.Set("Authorization", "Bearer "+admin)
+		req.RemoteAddr = "203.0.113.10:5000"
+		rec := httptest.NewRecorder()
+		f.app.Handler().ServeHTTP(rec, req)
+		return rec, rec.Body.String()
+	}
+	types := []string{"application/x-www-form-urlencoded", "text/plain", "", "multipart/form-data; boundary=x"}
+
+	// 改密：不执行（旧密码仍然有效），日志里没有新旧密码
+	for _, ct := range types {
+		rec, out := send("PUT", "/auth/password", ct, `{"oldPassword":"changed-pass-9","newPassword":"Leaked-New-Pass-1"}`)
+		require.Equal(t, 400, rec.Code, "%q: %s", ct, out)
+		require.Contains(t, out, `"code":3002`, ct)
+	}
+	rows := f.oplogs(app.OpChangePassword)
+	require.Len(t, rows, 1+len(types), "fixture 的首次改密 + 每个被拒绝的请求各一条")
+	for _, e := range rows {
+		require.NotContains(t, e.Body, "changed-pass-9")
+		require.NotContains(t, e.Body, "Leaked-New-Pass-1")
+		require.NotContains(t, e.Body, "changed-pass", "URL 编码之后的也不能有")
+	}
+	f.login("root", "changed-pass-9")
+
+	// 建用户：不执行，日志里没有密码
+	for _, ct := range types {
+		rec, out := send("POST", "/system/users", ct, `{"username":"mallory","password":"Leaked-User-Pass-1"}`)
+		require.Equal(t, 400, rec.Code, "%q: %s", ct, out)
+		require.Contains(t, out, `"code":3002`, ct)
+	}
+	var n int64
+	require.NoError(t, f.app.Deps().DB.Raw("SELECT COUNT(*) FROM ga_user WHERE username = 'mallory'").Scan(&n).Error)
+	require.Zero(t, n)
+	rows = f.oplogs(system.OpUserCreate)
+	require.Len(t, rows, len(types))
+	for _, e := range rows {
+		require.Equal(t, 400, e.HTTPStatus)
+		require.Equal(t, 3002, e.Code)
+		require.NotContains(t, e.Body, "Leaked-User-Pass-1")
+		require.NotContains(t, e.Body, "Leaked")
+	}
+
+	// 授权这类写接口同样不执行：类型不对就查不到"做了什么"的情形不存在
+	roleID := f.createRole(admin, "auditor", nil)
+	rec, out := send("PUT", fmt.Sprintf("/system/roles/%d/perms", roleID), "text/plain", `{"codes":["system:user:list"]}`)
+	require.Equal(t, 400, rec.Code, out)
+	r := f.do(admin, "GET", fmt.Sprintf("/system/roles/%d/perms", roleID), nil)
+	require.Equal(t, 0, r.env.Code)
+	require.Empty(t, r.env.Data, "类型不对的授权没有生效")
+
+	// 声明成 JSON 的照常执行
+	rec, out = send("POST", "/system/users", "application/json; charset=utf-8", `{"username":"carol","password":"Fine-Pass-123"}`)
+	require.Equal(t, 200, rec.Code, out)
+	require.Contains(t, out, `"code":0`)
+}

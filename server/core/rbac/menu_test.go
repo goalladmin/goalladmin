@@ -72,7 +72,7 @@ func TestResolveLayout_BadStoredDataFallsBackToCode(t *testing.T) {
 			seen[p] = true
 		}
 	}
-	tree := buildTree(nodes, func(string) bool { return true })
+	tree := buildTree(nodes, func(string) bool { return true }, false)
 	names := map[string]bool{}
 	var walk func(ts []*MenuTree)
 	walk = func(ts []*MenuTree) {
@@ -102,10 +102,10 @@ func TestBuildTree_EmptyContainersAreHidden(t *testing.T) {
 		{Portal: "p", Name: "page", Kind: kindCode, Moved: true, Parent: ""},
 		{Portal: "p", Name: "@g-000000000002", Kind: kindGroup, Moved: true, Titles: `{"zh-CN":"空"}`},
 	}
-	tree := buildTree(resolveLayout(code, rows), func(string) bool { return true })
+	tree := buildTree(resolveLayout(code, rows), func(string) bool { return true }, false)
 	require.Len(t, tree, 1)
 	require.Equal(t, "page", tree[0].Name)
-	require.Empty(t, buildTree(resolveLayout(code, rows), func(p string) bool { return p == "" }))
+	require.Empty(t, buildTree(resolveLayout(code, rows), func(p string) bool { return p == "" }, false))
 }
 
 // 看到一个菜单要的权限码 = 自己的 + 代码祖先的，与现在挪到哪里无关；库里把页面挪进带权限码的目录的数据会被退回。
@@ -148,7 +148,43 @@ func TestResolveLayout_VisibilityFollowsCodeAncestors(t *testing.T) {
 		return out
 	}
 	// 只有 audit-log 自己的权限码：挪到顶级后仍然看不到
-	require.Equal(t, []string{"open"}, top(buildTree(nodes, has("a:l:l", "o:p:l"))))
+	require.Equal(t, []string{"open"}, top(buildTree(nodes, has("a:l:l", "o:p:l"), false)))
 	// 两个都有才看得到
-	require.ElementsMatch(t, []string{"audit-log", "open"}, top(buildTree(nodes, has("a:l:l", "a:d:v", "o:p:l"))))
+	require.ElementsMatch(t, []string{"audit-log", "open"}, top(buildTree(nodes, has("a:l:l", "a:d:v", "o:p:l"), false)))
+}
+
+func TestMenu_176_SuperOnlySurvivesMove(t *testing.T) {
+	code := []MenuNode{
+		{Portal: "merchant", Name: "security", Path: "/security", SuperOnly: true},
+		{Portal: "merchant", Name: "allow", Parent: "security", Path: "/allow", Component: "allow"},
+		{Portal: "merchant", Name: "overview", Path: "/overview", Component: "overview"},
+	}
+	nodes := resolveLayout(code, []menuCustom{{Portal: "merchant", Name: "allow", Kind: kindCode, Moved: true, Parent: ""}})
+	staff := buildTree(nodes, func(string) bool { return true }, false)
+	require.Len(t, staff, 1)
+	require.Equal(t, "overview", staff[0].Name)
+	owner := buildTree(nodes, func(string) bool { return true }, true)
+	require.Len(t, owner, 2)
+}
+
+func TestMenu_178_OrdinaryPageCannotMoveIntoSuperDirectory(t *testing.T) {
+	code := []MenuNode{
+		{Portal: "merchant", Name: "security", Path: "/security", SuperOnly: true},
+		{Portal: "merchant", Name: "allow", Parent: "security", Path: "/allow", Component: "allow"},
+		{Portal: "merchant", Name: "overview", Path: "/overview", Component: "overview"},
+	}
+	nodes := resolveLayout(code, []menuCustom{{Portal: "merchant", Name: "overview", Kind: kindCode, Moved: true, Parent: "security"}})
+	staff := buildTree(nodes, func(string) bool { return true }, false)
+	require.Len(t, staff, 1)
+	require.Equal(t, "overview", staff[0].Name, "不相容的历史布局必须回退到代码位置")
+	var dir, page *layoutNode
+	for _, node := range nodes {
+		if node.Name == "security" {
+			dir = node
+		}
+		if node.Name == "overview" {
+			page = node
+		}
+	}
+	require.False(t, accepts(dir, page), "写入布局时也必须拒绝")
 }

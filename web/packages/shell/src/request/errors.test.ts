@@ -3,6 +3,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { describeApiError, formatApiError } from './errors'
+import { AllLocaleCodes, createPortalI18n, scopedMessages } from '../i18n'
 import { ApiError, Codes } from '../types'
 
 const dict: Record<string, string> = {
@@ -33,4 +34,22 @@ describe('describeApiError / formatApiError', () => {
     expect(formatApiError(new ApiError(4001, 'the menus have changed', { key: 'rbac.menu.maxDepth', params: { limit: 3 } }), t, te)).toBe('菜单最多 3 层')
     expect(formatApiError(new ApiError(4001, '资源冲突'), t, te)).toBe('资源冲突')
   })
+
+  for (const scoped of [false, true]) {
+    it.each(AllLocaleCodes)(`${scoped ? '主体端' : '平台端'} %s 的入驻字段错误使用当前语言`, (locale) => {
+      const { global: g } = createPortalI18n(scoped ? scopedMessages() : {})
+      g.locale.value = locale
+      for (const key of ['onboarding.invitation', 'onboarding.contact', 'onboarding.note', 'onboarding.reviewed', 'onboarding.decision']) {
+        const err = new ApiError(Codes.Validation, 'Invalid request', {
+          data: { fields: [{ field: 'application', message: 'backend fallback', key }] },
+        })
+        // te 不走回退链，保证每种语言在两个端都有自己的通用错误文案。
+        expect(g.te(`err.${key}`), key).toBe(true)
+        expect(describeApiError(err, (k, p) => g.t(k, p ?? {}), (k) => g.te(k))).toEqual([g.t(`err.${key}`)])
+        if (locale === 'zh-CN' && key === 'onboarding.reviewed') {
+          expect(g.t(`err.${key}`)).toBe('该申请已经审核，不能重复处理')
+        }
+      }
+    })
+  }
 })

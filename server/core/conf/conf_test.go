@@ -347,6 +347,114 @@ func TestValidate_DatabaseTimeoutsAndHandlerTimeout(t *testing.T) {
 	require.NoError(t, Validate(cfg), "边界值合法")
 }
 
+// 规范 §13.2 第 153 条（D-069）：连接池上限必须是正数——database/sql 把 0 和负数当成"不限"；空闲连接数不能是负数。
+// 环境变量把它改成 0 同样被拒绝；1 是合法的最小值，空闲连接数比上限大也合法（database/sql 自己会压下来）。
+func TestValidate_153_DatabasePoolLimits(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mod  func(c *Config)
+		want string
+	}{
+		{"上限 0 等于不限", func(c *Config) { c.Database.MaxOpenConns = 0 }, "database.maxOpenConns"},
+		{"上限负数", func(c *Config) { c.Database.MaxOpenConns = -1 }, "database.maxOpenConns"},
+		{"空闲连接数负数", func(c *Config) { c.Database.MaxIdleConns = -1 }, "database.maxIdleConns"},
+	} {
+		cfg := Default()
+		tc.mod(cfg)
+		err := Validate(cfg)
+		require.ErrorIs(t, err, ErrInvalidConfig, tc.name)
+		require.Contains(t, err.Error(), tc.want, tc.name)
+	}
+	for _, ok := range []struct{ open, idle int }{{1, 0}, {1, 10}, {50, 10}, {5, 5}} {
+		cfg := Default()
+		cfg.Database.MaxOpenConns, cfg.Database.MaxIdleConns = ok.open, ok.idle
+		require.NoError(t, Validate(cfg), "%+v", ok)
+	}
+	require.NoError(t, Validate(Default()), "默认值合法")
+
+	t.Setenv("GA_DB_MAX_OPEN_CONNS", "0")
+	cfg, err := Load("")
+	require.NoError(t, err)
+	require.Equal(t, 0, cfg.Database.MaxOpenConns)
+	err = Validate(cfg)
+	require.ErrorIs(t, err, ErrInvalidConfig, "环境变量改成 0 也拒绝")
+	require.Contains(t, err.Error(), "database.maxOpenConns")
+}
+
+// 规范 §13.2 第 156 条（D-070）：密码计算的并发上限 server.passwordParallel——默认 0（按 CPU 数），可以用环境变量设；
+// 负数和大得离谱的值拒绝启动。
+func TestValidate_156_PasswordParallel(t *testing.T) {
+	require.Zero(t, Default().Server.PasswordParallel)
+	for _, bad := range []int{-1, MaxPasswordParallel + 1} {
+		cfg := Default()
+		cfg.Server.PasswordParallel = bad
+		err := Validate(cfg)
+		require.ErrorIs(t, err, ErrInvalidConfig, "%d", bad)
+		require.Contains(t, err.Error(), "server.passwordParallel")
+	}
+	for _, ok := range []int{0, 1, 8, MaxPasswordParallel} {
+		cfg := Default()
+		cfg.Server.PasswordParallel = ok
+		require.NoError(t, Validate(cfg), "%d", ok)
+	}
+	t.Setenv("GA_SERVER_PASSWORD_PARALLEL", "6")
+	cfg, err := Load("")
+	require.NoError(t, err)
+	require.Equal(t, 6, cfg.Server.PasswordParallel)
+	require.NoError(t, Validate(cfg))
+}
+
+// 规范 §13.2 第 160 条（D-070）：密码哈希算法 server.passwordHash——默认 argon2id，可以选 bcrypt、可以用环境变量设；
+// 别的值（包括空、大小写不对的）拒绝启动，不悄悄用默认的。
+func TestValidate_160_PasswordHashAlgorithm(t *testing.T) {
+	require.Equal(t, PasswordHashArgon2id, Default().Server.PasswordHash)
+	for _, bad := range []string{"", "scrypt", "ARGON2ID", "Bcrypt", "argon2", "argon2id ", "pbkdf2", "pbkdf2-sha1", "PBKDF2-SHA256"} {
+		cfg := Default()
+		cfg.Server.PasswordHash = bad
+		err := Validate(cfg)
+		require.ErrorIs(t, err, ErrInvalidConfig, "%q", bad)
+		require.Contains(t, err.Error(), "server.passwordHash")
+	}
+	for _, ok := range []string{PasswordHashArgon2id, PasswordHashBcrypt} {
+		cfg := Default()
+		cfg.Server.PasswordHash = ok
+		require.NoError(t, Validate(cfg), ok)
+	}
+	t.Setenv("GA_SERVER_PASSWORD_HASH", "bcrypt")
+	cfg, err := Load("")
+	require.NoError(t, err)
+	require.Equal(t, PasswordHashBcrypt, cfg.Server.PasswordHash)
+	require.NoError(t, Validate(cfg))
+}
+
+// 规范 §13.2 第 161 条（D-072）：server.passwordHash 还可以是 pbkdf2-sha256、pbkdf2-sha512（给有 FIPS 140 要求的部署），
+// 可以用环境变量设；不带摘要算法的 pbkdf2、SHA-1 的、SHA-384 的、大小写不对的拒绝启动，报错里列出可以取的值。
+func TestValidate_161_PBKDF2Algorithms(t *testing.T) {
+	require.Equal(t, []string{"argon2id", "bcrypt", "pbkdf2-sha256", "pbkdf2-sha512"}, PasswordHashes())
+	require.Equal(t, PasswordHashes()[0], Default().Server.PasswordHash, "默认的排在最前")
+	for _, ok := range PasswordHashes() {
+		cfg := Default()
+		cfg.Server.PasswordHash = ok
+		require.NoError(t, Validate(cfg), ok)
+	}
+	for _, bad := range []string{"pbkdf2", "pbkdf2-sha1", "pbkdf2-sha384", "pbkdf2_sha256", "PBKDF2-SHA512", "pbkdf2-sha256 ", "sha256"} {
+		cfg := Default()
+		cfg.Server.PasswordHash = bad
+		err := Validate(cfg)
+		require.ErrorIs(t, err, ErrInvalidConfig, "%q", bad)
+		for _, ok := range PasswordHashes() {
+			require.Contains(t, err.Error(), ok, "报错里列出可以取的值")
+		}
+	}
+	for _, name := range []string{PasswordHashPBKDF2SHA256, PasswordHashPBKDF2SHA512} {
+		t.Setenv("GA_SERVER_PASSWORD_HASH", name)
+		cfg, err := Load("")
+		require.NoError(t, err)
+		require.Equal(t, name, cfg.Server.PasswordHash)
+		require.NoError(t, Validate(cfg))
+	}
+}
+
 func TestLoad_DatabaseProtectionFromEnv(t *testing.T) {
 	t.Setenv("GA_DB_CONNECT_TIMEOUT", "3s")
 	t.Setenv("GA_DB_READ_TIMEOUT", "2m")
@@ -360,4 +468,157 @@ func TestLoad_DatabaseProtectionFromEnv(t *testing.T) {
 	require.Equal(t, 45*time.Second, cfg.Database.WriteTimeout)
 	require.Equal(t, 90*time.Second, cfg.Database.ConnectWait)
 	require.Equal(t, 20*time.Second, cfg.Server.HandlerTimeout)
+}
+
+// D-061：代理商、商户程序只加载自己的端。配置文件里别的端（含密钥）被丢掉，release 模式也不要求别的端的密钥。
+func TestLoadFor_KeepsOnlyListedPortals(t *testing.T) {
+	t.Setenv("GA_JWT_SECRET_PLATFORM", "")
+	t.Setenv("GA_JWT_SECRET_MERCHANT", "merchant-secret-from-env-0123456789abcdef")
+	p := writeYAML(t, `
+server:
+  mode: release
+  allowedOrigins: ["https://merchant.example.com"]
+database:
+  password: db-secret
+portals:
+  platform:
+    jwtSecret: platform-secret-in-file-0123456789abcdef
+  merchant:
+    accessTTL: 10m
+    jwtSecret: merchant-secret-in-file-0123456789abcdef
+`)
+	cfg, err := LoadFor(p, "merchant")
+	require.NoError(t, err)
+	require.Len(t, cfg.Portals, 1)
+	require.Contains(t, cfg.Portals, "merchant")
+	require.NotContains(t, cfg.Portals, DefaultPortalCode, "平台端的段落和密钥不能进商户程序")
+	require.Equal(t, "merchant-secret-from-env-0123456789abcdef", cfg.Portals["merchant"].JWTSecret, "环境变量优先")
+	require.Equal(t, 10*time.Minute, cfg.Portals["merchant"].AccessTTL)
+	require.Equal(t, 168*time.Hour, cfg.Portals["merchant"].RefreshTTL, "没写的有效期取默认值")
+	require.NoError(t, Validate(cfg), "release 模式只要求本程序的端有密钥")
+
+	// 没有配置文件、只有环境变量：列出的端补上默认值
+	cfg, err = LoadFor("", "agent")
+	require.NoError(t, err)
+	require.Len(t, cfg.Portals, 1)
+	require.Equal(t, 15*time.Minute, cfg.Portals["agent"].AccessTTL)
+
+	// 本程序的端没有密钥：release 模式拒绝启动（别的端有也不算）
+	t.Setenv("GA_JWT_SECRET_MERCHANT", "")
+	p = writeYAML(t, `
+server:
+  mode: release
+  allowedOrigins: ["https://merchant.example.com"]
+database:
+  password: db-secret
+portals:
+  platform:
+    jwtSecret: platform-secret-in-file-0123456789abcdef
+`)
+	cfg, err = LoadFor(p, "merchant")
+	require.NoError(t, err)
+	require.ErrorContains(t, Validate(cfg), "端 merchant 缺少 JWT 密钥")
+
+	_, err = LoadFor(p)
+	require.Error(t, err)
+}
+
+// 规范 §13.2 第 163 条（D-074）：Redis 是可选的——默认不配（addr 为空），这时别的 redis.* 写什么都不检查；
+// 配了 addr 才校验：地址是 主机:端口，库号 0–255，键前缀 1–32 个字符且只有字母、数字和 : _ -（不能有花括号、
+// 通配符、空白），设了用户名就得有密码，启动等待 0–10 分钟。每一项都能用环境变量设。
+func TestValidate_163_Redis(t *testing.T) {
+	def := Default()
+	require.False(t, def.Redis.Enabled(), "默认不用 Redis")
+	require.Equal(t, "", def.Redis.Addr)
+	require.Equal(t, "ga:", def.Redis.KeyPrefix)
+	require.Equal(t, 5*time.Second, def.Redis.ConnectWait)
+	require.NoError(t, Validate(def))
+
+	// 没配地址：别的写错了也不管
+	off := Default()
+	off.Redis = Redis{DB: -1, KeyPrefix: "{bad}", Username: "u", ConnectWait: -time.Second}
+	require.NoError(t, Validate(off))
+
+	on := func(tweak func(r *Redis)) error {
+		cfg := Default()
+		cfg.Redis.Addr = "127.0.0.1:6379"
+		tweak(&cfg.Redis)
+		return Validate(cfg)
+	}
+	require.NoError(t, on(func(*Redis) {}))
+	for _, addr := range []string{"redis.internal:6380", "[::1]:6379", "r-abc.redis.example.com:6379", "10.0.0.5:1", "h:65535"} {
+		require.NoError(t, on(func(r *Redis) { r.Addr = addr }), addr)
+	}
+	for _, addr := range []string{"127.0.0.1", "localhost:", ":6379", "host:0", "host:65536", "host:abc", "host:06379", "redis://host:6379", "a:1:2", "host: 6379"} {
+		err := on(func(r *Redis) { r.Addr = addr })
+		require.ErrorIs(t, err, ErrInvalidConfig, addr)
+		require.Contains(t, err.Error(), "redis.addr", addr)
+	}
+	for _, db := range []int{0, 1, 15, 255} {
+		require.NoError(t, on(func(r *Redis) { r.DB = db }), db)
+	}
+	for _, db := range []int{-1, 256, 1000} {
+		require.ErrorContains(t, on(func(r *Redis) { r.DB = db }), "redis.db", db)
+	}
+	for _, p := range []string{"ga:", "a", "prod_1:", "team-a:ga:", strings.Repeat("x", 32)} {
+		require.NoError(t, on(func(r *Redis) { r.KeyPrefix = p }), p)
+	}
+	for _, p := range []string{"", "ga {x}:", "{ga}:", "ga*", "ga ?", "带中文:", "a b", "a\n", strings.Repeat("x", 33)} {
+		require.ErrorContains(t, on(func(r *Redis) { r.KeyPrefix = p }), "redis.keyPrefix", "%q", p)
+	}
+	require.NoError(t, on(func(r *Redis) { r.Password = "only-password" }))
+	require.NoError(t, on(func(r *Redis) { r.Username, r.Password = "app", "pw" }))
+	require.ErrorContains(t, on(func(r *Redis) { r.Username = "app" }), "redis.password")
+	for _, w := range []time.Duration{0, time.Second, 10 * time.Minute} {
+		require.NoError(t, on(func(r *Redis) { r.ConnectWait = w }), w)
+	}
+	for _, w := range []time.Duration{-time.Second, 10*time.Minute + time.Second} {
+		require.ErrorContains(t, on(func(r *Redis) { r.ConnectWait = w }), "redis.connectWait", w)
+	}
+
+	t.Setenv("GA_REDIS_ADDR", "cache.internal:6380")
+	t.Setenv("GA_REDIS_USERNAME", "app")
+	t.Setenv("GA_REDIS_PASSWORD", "from-env")
+	t.Setenv("GA_REDIS_DB", "3")
+	t.Setenv("GA_REDIS_TLS", "true")
+	t.Setenv("GA_REDIS_KEY_PREFIX", "prod:")
+	t.Setenv("GA_REDIS_CONNECT_WAIT", "30s")
+	cfg, err := Load("")
+	require.NoError(t, err)
+	require.Equal(t, Redis{Addr: "cache.internal:6380", Username: "app", Password: "from-env", DB: 3, TLS: true, KeyPrefix: "prod:", ConnectWait: 30 * time.Second}, cfg.Redis)
+	require.True(t, cfg.Redis.Enabled())
+	require.NoError(t, Validate(cfg))
+}
+
+// 182（D-098）：release 模式不接受全网段的可信代理；debug 模式不限制。
+func TestValidate_182_ReleaseRejectsTrustEveryoneProxies(t *testing.T) {
+	release := func(proxies ...string) error {
+		cfg := Default()
+		cfg.Server.Mode = ModeRelease
+		cfg.Server.AllowedOrigins = []string{"https://admin.example.com"}
+		cfg.Database.Password = "db-password"
+		cfg.Portals["platform"] = Portal{AccessTTL: 15 * time.Minute, RefreshTTL: 168 * time.Hour, JWTSecret: strings.Repeat("k", 16) + strings.Repeat("7", 16)}
+		cfg.Server.TrustedProxies = proxies
+		return Validate(cfg)
+	}
+	require.NoError(t, release())
+	require.NoError(t, release("10.0.0.5", "10.0.1.0/24", "172.16.0.0/12", "fd00::/8", "::ffff:10.0.0.0/104", "::1/128"))
+	for _, all := range []string{"0.0.0.0/0", "::/0", "10.1.2.3/0", "::ffff:0:0/96", "::ffff:0.0.0.0/96"} {
+		err := release("10.0.0.5", all)
+		require.ErrorIs(t, err, ErrInvalidConfig, all)
+		require.Contains(t, err.Error(), "trustedProxies", all)
+	}
+	cfg := Default() // debug
+	cfg.Server.TrustedProxies = []string{"0.0.0.0/0"}
+	require.NoError(t, Validate(cfg))
+}
+
+// 182（D-098）：哪些监听地址会接受本机之外的连接。
+func TestServer_182_ListensBeyondLoopback(t *testing.T) {
+	for addr, want := range map[string]bool{
+		"0.0.0.0:8080": true, ":8080": true, "[::]:8080": true, "192.168.1.5:8080": true, "example.internal:8080": true, "bad": true,
+		"127.0.0.1:8080": false, "localhost:8080": false, "[::1]:8080": false, "127.0.0.9:80": false,
+	} {
+		require.Equal(t, want, Server{Addr: addr}.ListensBeyondLoopback(), addr)
+	}
 }

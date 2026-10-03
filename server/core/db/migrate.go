@@ -153,6 +153,48 @@ func MigrateStatus(ctx context.Context, gdb *gorm.DB, fsys fs.FS, dir, table str
 	return out, nil
 }
 
+// ErrMigrationsPending 表示数据库的表结构落后于这个程序带的迁移文件。
+var ErrMigrationsPending = errors.New("db: 数据库的表结构落后于本程序，先在平台程序上执行迁移")
+
+// MigrateCheck 只读地核对 dir 下的迁移是否都已应用（D-061）：不建版本表、不加锁、不执行任何 DDL，
+// 给不执行迁移的程序（代理商、商户）启动时用，它们的数据库账号可以没有改表权限。
+// 有没应用的迁移、或者版本表不存在时返回包装了 ErrMigrationsPending 的错误；版本表里有本程序不认识的更新版本不算错
+// （平台先升级了，迁移按"兼容旧程序"的方式写）。
+func MigrateCheck(ctx context.Context, gdb *gorm.DB, fsys fs.FS, dir, table string) error {
+	if !versionTableRe.MatchString(table) {
+		return fmt.Errorf("db: 版本表名 %q 无效", table)
+	}
+	migrations, err := LoadMigrations(fsys, dir)
+	if err != nil {
+		return err
+	}
+	conn := gdb.WithContext(ctx)
+	var n int64
+	if err := conn.Raw("SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?", table).Scan(&n).Error; err != nil {
+		return fmt.Errorf("db: 查询版本表 %s: %w", table, err)
+	}
+	if n == 0 {
+		if len(migrations) == 0 {
+			return nil
+		}
+		return fmt.Errorf("%w：版本表 %s 不存在", ErrMigrationsPending, table)
+	}
+	done, err := appliedVersions(conn, table)
+	if err != nil {
+		return err
+	}
+	var pending []string
+	for _, m := range migrations {
+		if _, ok := done[m.Version]; !ok {
+			pending = append(pending, path.Base(m.File))
+		}
+	}
+	if len(pending) > 0 {
+		return fmt.Errorf("%w：%s 里还没应用 %s", ErrMigrationsPending, table, strings.Join(pending, "、"))
+	}
+	return nil
+}
+
 func ensureVersionTable(conn *gorm.DB, table string) error {
 	ddl := fmt.Sprintf("CREATE TABLE IF NOT EXISTS `%s` ("+
 		"`version` bigint NOT NULL, `name` varchar(255) NOT NULL DEFAULT '', "+

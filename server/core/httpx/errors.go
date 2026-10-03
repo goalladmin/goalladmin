@@ -116,6 +116,7 @@ var (
 	ErrTokenInvalid      = New(CodeTokenInvalid, "")
 	ErrForbidden         = New(CodeForbidden, "")
 	ErrPwdChangeRequired = New(CodePwdChangeRequired, "")
+	ErrIPDenied          = New(CodeIPDenied, "")
 	ErrSessionLocked     = New(CodeSessionLocked, "")
 	ErrValidation        = New(CodeValidation, "")
 	ErrBadRequest        = New(CodeBadRequest, "")

@@ -133,6 +133,8 @@ func encodeJPEG(img image.Image, quality int) ([]byte, error) {
 // jpegScans 数 JPEG 里的扫描段（SOS）有多少个，不解码。结构读不懂时 ok 为 false。
 // 段的格式：FF xx；SOI、EOI、RSTn、TEM 没有长度，其余带两字节长度；SOS 的头之后是熵编码数据，
 // 其中的 FF 00（转义）和 FF D0–D7（重启标记）不算段的结束。
+// 段与段之间只认 FF 开头的标记：别的字节、段标记位置上的 FF 00 都按读不懂处理——解码器对它们比这里宽松，
+// 数出来的段数必须不少于解码器实际处理的（D-096）。
 func jpegScans(b []byte) (n int, ok bool) {
 	if len(b) < 4 || b[0] != 0xFF || b[1] != 0xD8 {
 		return 0, false
@@ -151,6 +153,10 @@ func jpegScans(b []byte) (n int, ok bool) {
 		m := b[i]
 		i++
 		switch {
+		case m == 0x00:
+			// 段标记位置上的 FF 00：解码器把它当多余的字节丢掉、接着往后找标记，不读长度；这里要是按"带长度的段"
+			// 跳过，被跳过的字节里的扫描段解码器会处理、这里却数不到。两边理解不同的写法一律按读不懂处理（D-096）
+			return n, false
 		case m == 0xD9: // EOI
 			return n, true
 		case m == 0x01 || (m >= 0xD0 && m <= 0xD7):

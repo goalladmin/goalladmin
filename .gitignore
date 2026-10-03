@@ -3,6 +3,8 @@
 /server/tmp/
 /web/**/dist/
 /web/**/node_modules/
+# 前端都在 web/ 里（D-064）；仓库根目录误装出来的依赖也不能进 git
+/node_modules/
 /.pnpm-store/
 
 # local config and secrets

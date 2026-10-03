@@ -23,6 +23,9 @@ import (
 	"github.com/goalladmin/goalladmin/server/core/db"
 	"github.com/goalladmin/goalladmin/server/core/logx"
 	"github.com/goalladmin/goalladmin/server/core/rbac"
+	"github.com/goalladmin/goalladmin/server/modules/agentportal"
+	"github.com/goalladmin/goalladmin/server/modules/merchantportal"
+	"github.com/goalladmin/goalladmin/server/modules/onboarding"
 )
 
 func TestAPIDocMatchesRoutes(t *testing.T) {
@@ -42,39 +45,66 @@ func TestAPIDocMatchesRoutes(t *testing.T) {
 	require.NoError(t, err)
 	text := string(doc)
 
-	// "公开接口"一节里的表格行：| 方法 | `路径` | ...
+	// D-080：按文档声明的端核对，不让主体端公开接口意外出现在平台。
 	section := text[strings.Index(text, "## 公开接口"):]
 	section = section[:strings.Index(section, "\n## ")]
-	rowRe := regexp.MustCompile("(?m)^\\| *([A-Z]+) *\\| *`([^`]+)` *\\|")
+	rowRe := regexp.MustCompile("(?m)^\\| *([a-z,]+) *\\| *([A-Z]+) *\\| *`([^`]+)` *\\|")
 	documented := map[string]bool{}
 	for _, m := range rowRe.FindAllStringSubmatch(section, -1) {
-		documented[m[1]+" "+m[2]] = true
+		for _, code := range strings.Split(m[1], ",") {
+			documented[code+" "+m[2]+" "+m[3]] = true
+		}
 	}
 	require.NotEmpty(t, documented)
-
-	actual := map[string]bool{}
-	for _, r := range a.Routes() {
-		rel := strings.TrimPrefix(r.Path, app.PortalPrefix(r.Portal))
-		if r.Guard == rbac.GuardPublic {
-			actual[r.Method+" "+rel] = true
+	apps := make([]*app.App, 0, 3)
+	apps = append(apps, a)
+	for _, code := range []string{"agent", "merchant"} {
+		c := conf.Default()
+		c.Portals = map[string]conf.Portal{code: p}
+		other, err := app.New(c, app.WithDB(gdb), app.WithoutMigrations(), app.WithLogger(logx.New("error", "text", io.Discard)))
+		require.NoError(t, err)
+		if code == "agent" {
+			other.Register(agentportal.Module())
+		} else {
+			other.Register(merchantportal.Module())
 		}
-		// 路径在文档里出现过：写成完整相对路径，或者去掉第一段（模块前缀）后的路径
-		short := rel
-		if i := strings.Index(rel[1:], "/"); i >= 0 {
-			short = rel[1+i:]
-		}
-		require.True(t, strings.Contains(text, "`"+rel+"`") || strings.Contains(text, "`"+short+"`"),
-			"%s %s 没有写进 docs/api.md", r.Method, r.Path)
+		other.Register(onboarding.Module(code))
+		require.NoError(t, other.Setup())
+		apps = append(apps, other)
 	}
-	require.Equal(t, documented, actual, "docs/api.md 的公开接口清单与实际 Public 路由不一致")
+	actual := map[string]bool{}
+	for _, application := range apps {
+		for _, r := range application.Routes() {
+			rel := strings.TrimPrefix(r.Path, app.PortalPrefix(r.Portal))
+			if r.Guard == rbac.GuardPublic {
+				actual[r.Portal+" "+r.Method+" "+rel] = true
+			}
+			short := rel
+			if i := strings.Index(rel[1:], "/"); i >= 0 {
+				short = rel[1+i:]
+			}
+			require.True(t, strings.Contains(text, "`"+rel+"`") || strings.Contains(text, "`"+short+"`"), "%s %s 没有写进 docs/api.md", r.Method, r.Path)
+		}
+	}
+	require.Equal(t, documented, actual, "docs/api.md 的公开接口清单与三端实际 Public 路由不一致")
 }
 
 // 后端镜像的构建上下文只 COPY 二进制需要的目录（deploy/Dockerfile.server 有意这么做，防止本地配置进镜像）：
 // main.go 直接 import 的每个本仓库目录都必须在 COPY 清单里，否则镜像里 go build 会缺包（D-043）。
 func TestDockerfileCopiesEveryDirectoryMainImports(t *testing.T) {
-	src, err := os.ReadFile("main.go")
-	require.NoError(t, err)
 	dockerfile, err := os.ReadFile(filepath.Join("..", "deploy", "Dockerfile.server"))
+	require.NoError(t, err)
+	// 168：三个入口及主体端共用命令行依赖的顶层目录都必须进入构建上下文。
+	for _, entry := range []string{"main.go", "cmd/agent/main.go", "cmd/merchant/main.go", "internal/portalcmd/portalcmd.go"} {
+		t.Run(entry, func(t *testing.T) {
+			assertDockerfileImports(t, entry, string(dockerfile))
+		})
+	}
+}
+
+func assertDockerfileImports(t *testing.T, entry, dockerfile string) {
+	t.Helper()
+	src, err := os.ReadFile(entry)
 	require.NoError(t, err)
 	const module = "github.com/goalladmin/goalladmin/server/"
 	need := map[string]bool{}
@@ -89,7 +119,7 @@ func TestDockerfileCopiesEveryDirectoryMainImports(t *testing.T) {
 	}
 	require.NotEmpty(t, need)
 	for dir := range need {
-		require.Contains(t, string(dockerfile), "COPY server/"+dir+" "+dir+"/", "Dockerfile.server 没有把 main.go 用到的 server/%s 复制进构建上下文", dir)
+		require.Contains(t, dockerfile, "COPY server/"+dir+" "+dir+"/", "Dockerfile.server 没有把 %s 用到的 server/%s 复制进构建上下文", entry, dir)
 	}
 }
 

@@ -1,7 +1,7 @@
 package system
 
 // 部门与岗位（docs/decisions.md D-033）。部门本身不带任何权限；按部门的数据权限（D-039）把它当作
-// "本部门""本部门及下级"的参照点，由 orgProvider 提供给内核。
+// "本部门""本部门及下级"的参照点，由 deptProvider 提供给内核。
 
 import (
 	"context"
@@ -85,10 +85,10 @@ func NewOrgService(deps *app.Deps, users *UserRepo) *OrgService {
 	return &OrgService{deps: deps, users: users}
 }
 
-// orgProvider 把组织结构提供给内核，按部门的数据权限用（D-039）。每次现查，调部门立即生效。
-type orgProvider struct{ s *OrgService }
+// deptProvider 把部门结构提供给内核，按部门的数据权限用（D-039）。每次现查，调部门立即生效。
+type deptProvider struct{ s *OrgService }
 
-func (p orgProvider) UserDept(ctx context.Context, userID uint64) (uint64, error) {
+func (p deptProvider) UserDept(ctx context.Context, userID uint64) (uint64, error) {
 	u, err := p.s.users.FindByID(ctx, userID)
 	if errors.Is(err, portal.ErrAccountNotFound) {
 		return 0, nil
@@ -99,7 +99,7 @@ func (p orgProvider) UserDept(ctx context.Context, userID uint64) (uint64, error
 	return u.DeptID, nil
 }
 
-func (p orgProvider) DeptSubtree(ctx context.Context, deptID uint64) ([]uint64, error) {
+func (p deptProvider) DeptSubtree(ctx context.Context, deptID uint64) ([]uint64, error) {
 	return p.s.deptSubtree(ctx, deptID)
 }
 
@@ -710,10 +710,10 @@ func (s *OrgService) assignOrg(ctx context.Context, u *User, deptID *uint64, pos
 	if postIDs == nil {
 		return nil
 	}
-	ids := dedup(*postIDs)
-	if len(ids) > maxUserPosts {
+	if len(*postIDs) > maxUserPosts {
 		return httpx.ErrValidation.WithFields(httpx.NewField("postIds", "system.user.posts", "at most 20 posts", "max", maxUserPosts))
 	}
+	ids := dedup(*postIDs)
 	var current []uint64
 	if err := db.From(ctx).Model(&userPost{}).Where("user_id = ?", u.ID).Pluck("post_id", &current).Error; err != nil {
 		return err

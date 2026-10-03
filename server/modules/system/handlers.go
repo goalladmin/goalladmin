@@ -71,7 +71,7 @@ type createUserRequest struct {
 	DisplayName string   `json:"displayName" binding:"max=64"`
 	Email       string   `json:"email" binding:"omitempty,email,max=128"`
 	Phone       string   `json:"phone" binding:"max=32"`
-	RoleIDs     []uint64 `json:"roleIds"`
+	RoleIDs     []uint64 `json:"roleIds" binding:"max=20"`
 	DeptID      uint64   `json:"deptId"`
 	PostIDs     []uint64 `json:"postIds"`
 	Sort        uint     `json:"sort" binding:"max=1000000"`
@@ -160,7 +160,7 @@ func (h *handlers) resetUserPassword(c *gin.Context) {
 }
 
 type assignRolesRequest struct {
-	RoleIDs []uint64 `json:"roleIds"`
+	RoleIDs []uint64 `json:"roleIds" binding:"max=20"`
 }
 
 func (h *handlers) assignUserRoles(c *gin.Context) {
@@ -219,7 +219,7 @@ func (r roleRequest) input() rbac.RoleInput {
 	if r.Status != nil {
 		status = *r.Status
 	}
-	return rbac.RoleInput{Code: r.Code, Name: r.Name, Status: status, Sort: r.Sort, Remark: r.Remark}
+	return rbac.RoleInput{Code: r.Code, Name: r.Name, Status: status, Sort: r.Sort, Remark: r.Remark, KeepStatus: r.Status == nil}
 }
 
 func (h *handlers) createRole(c *gin.Context) {
@@ -286,7 +286,7 @@ func (h *handlers) rolePerms(c *gin.Context) {
 }
 
 type grantRequest struct {
-	Codes []string `json:"codes"`
+	Codes []string `json:"codes" binding:"max=1024"`
 	// DataScopes 是数据资源 → 范围（D-039）；不传或不含某个资源时，该资源的范围不变
 	DataScopes map[string]rbac.DataScope `json:"dataScopes"`
 }

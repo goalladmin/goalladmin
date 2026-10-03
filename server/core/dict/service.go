@@ -25,6 +25,7 @@ type Service struct {
 	log      *slog.Logger
 	now      func() time.Time
 	portalOK func(string) bool
+	onChange func(code string)
 	cache    *ttlcache.Cache[*loaded]
 	decls    map[string]Dict // 代码声明，编码 → 声明；Sync 时填入，供"恢复默认"和"是否改过"判断
 	// 缓存回填靠 cache 自己的失效代数（Gen / SetIfGen）：写入方 Delete / Flush 之后，读方读库前记下的代数就作废，
@@ -39,6 +40,8 @@ type Options struct {
 	CacheTTL time.Duration
 	// PortalOK 报告端代号是否已注册，后台新建字典时校验。为 nil 时只接受 AllPortals。
 	PortalOK func(string) bool
+	// OnChange 在字典成功提交、本地清缓存之后调用；code 为空表示全部字典。
+	OnChange func(code string)
 }
 
 // NewService 创建字典服务。
@@ -50,13 +53,13 @@ func NewService(o Options) *Service {
 		o.Now = time.Now
 	}
 	if o.CacheTTL <= 0 {
-		o.CacheTTL = time.Minute
+		o.CacheTTL = 15 * time.Second
 	}
 	if o.PortalOK == nil {
 		o.PortalOK = func(string) bool { return false }
 	}
 	return &Service{
-		log: o.Log.With("component", "dict"), now: o.Now, portalOK: o.PortalOK,
+		log: o.Log.With("component", "dict"), now: o.Now, portalOK: o.PortalOK, onChange: o.OnChange,
 		cache: ttlcache.New[*loaded](o.CacheTTL, o.Now), decls: map[string]Dict{},
 	}
 }
@@ -105,9 +108,21 @@ func (s *Service) load(ctx context.Context, code string) (*loaded, error) {
 func (s *Service) forget(ctx context.Context, codes ...string) {
 	db.AfterCommit(ctx, func() {
 		for _, c := range codes {
-			s.cache.Delete(c)
+			s.Invalidate(c)
+			if s.onChange != nil {
+				s.onChange(c)
+			}
 		}
 	})
+}
+
+// Invalidate 清一本字典的缓存；code 为空时全清。远端通知不读库、不再次通知（D-075）。
+func (s *Service) Invalidate(code string) {
+	if code == "" {
+		s.cache.Flush()
+		return
+	}
+	s.cache.Delete(code)
 }
 
 func actorID(ctx context.Context) uint64 {
@@ -311,7 +326,13 @@ func (s *Service) sync(ctx context.Context, decls []Decl) error {
 	sort.Strings(codes)
 	for _, c := range codes {
 		d := s.decls[c]
-		if err := db.Tx(ctx, func(ctx context.Context) error { return s.syncOne(ctx, d) }); err != nil {
+		if err := db.Tx(ctx, func(ctx context.Context) error {
+			if err := s.syncOne(ctx, d); err != nil {
+				return err
+			}
+			s.forget(ctx, c)
+			return nil
+		}); err != nil {
 			return fmt.Errorf("dict: 同步 %s: %w", c, err)
 		}
 	}
@@ -330,8 +351,12 @@ func (s *Service) sync(ctx context.Context, decls []Decl) error {
 				Updates(map[string]any{"source": SourceAdmin, "updated_at": now}).Error; err != nil {
 				return err
 			}
-			return db.From(ctx).Model(&itemRow{}).Where("dict_id = ?", o.ID).
-				Updates(map[string]any{"locked": false, "overridden": false, "updated_at": now}).Error
+			if err := db.From(ctx).Model(&itemRow{}).Where("dict_id = ?", o.ID).
+				Updates(map[string]any{"locked": false, "overridden": false, "updated_at": now}).Error; err != nil {
+				return err
+			}
+			s.forget(ctx, o.Code)
+			return nil
 		})
 		if err != nil {
 			return fmt.Errorf("dict: 释放字典 %s: %w", o.Code, err)

@@ -20,6 +20,7 @@ import (
 type Role struct {
 	ID        uint64    `gorm:"column:id;primaryKey" json:"id"`
 	Portal    string    `gorm:"column:portal" json:"portal"`
+	OrgID     uint64    `gorm:"column:org_id" json:"-"` // 所属主体（D-063）：主体端的角色属于一个主体，平台端为 0；不随接口输出
 	Code      string    `gorm:"column:code" json:"code"`
 	Name      string    `gorm:"column:name" json:"name"`
 	IsSuper   bool      `gorm:"column:is_super" json:"isSuper"`
@@ -88,16 +89,19 @@ func roleSubject(roleID uint64) string { return fmt.Sprintf("role:%d", roleID) }
 // store 封装三张表的读写。所有方法通过 db.From(ctx) 拿句柄，可以参与调用方的事务。
 type store struct{}
 
-func (store) roles(ctx context.Context, portal string) ([]Role, error) {
+// 下面按端读写角色的方法都带 org：主体端的角色只在自己的主体里可见（D-063），平台端 org 恒为 0。
+// org 由 Service 从身份上取（actorOrg、viewOrg），存储层只负责把它放进每一条条件。
+
+func (store) roles(ctx context.Context, portal string, org uint64) ([]Role, error) {
 	var out []roleRow
-	err := db.From(ctx).Where("portal = ?", portal).Order("sort ASC, id ASC").Find(&out).Error
+	err := db.From(ctx).Where("portal = ? AND org_id = ?", portal, org).Order("sort ASC, id ASC").Find(&out).Error
 	return rolesOf(out), err
 }
 
-// role 按 (portal, id) 读角色：角色 ID 全局唯一，但每个端只能看见、改动自己的角色（规范 §6.7）。
-func (store) role(ctx context.Context, portal string, id uint64) (*Role, error) {
+// role 按 (portal, org, id) 读角色：角色 ID 全局唯一，但每个端、每个主体只能看见、改动自己的角色（规范 §6.7，D-063）。
+func (store) role(ctx context.Context, portal string, org, id uint64) (*Role, error) {
 	var r roleRow
-	err := db.From(ctx).Where("portal = ? AND id = ?", portal, id).First(&r).Error
+	err := db.From(ctx).Where("portal = ? AND org_id = ? AND id = ?", portal, org, id).First(&r).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, ErrRoleNotFound
 	}
@@ -115,12 +119,19 @@ func (store) lockSuperRole(ctx context.Context, portal string) error {
 		Where("portal = ? AND is_super = 1", portal).Find(&rows).Error
 }
 
+// hasSuperRole 报告这个端有没有超管角色。主体端没有（主体内的超管是主账号，D-063）。
+func (store) hasSuperRole(ctx context.Context, portal string) (bool, error) {
+	var n int64
+	err := db.From(ctx).Model(&roleRow{}).Where("portal = ? AND is_super = 1", portal).Limit(1).Count(&n).Error
+	return n > 0, err
+}
+
 // lockRole 用 SELECT ... FOR UPDATE 锁住一个角色行，直到当前事务结束（授权时串行化同一角色的并发修改），
 // 并返回锁定读看到的那一行：锁定读读的是最新已提交的数据，不受事务快照影响，锁内的判断要用它而不是再做一次普通读。
 // 角色不存在（例如刚被并发删除）时返回 ErrRoleNotFound，调用方不会对着一个已删除的角色继续写授权。
-func (store) lockRole(ctx context.Context, portal string, id uint64) (*Role, error) {
+func (store) lockRole(ctx context.Context, portal string, org, id uint64) (*Role, error) {
 	var rows []roleRow
-	if err := db.From(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).Where("portal = ? AND id = ?", portal, id).Find(&rows).Error; err != nil {
+	if err := db.From(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).Where("portal = ? AND org_id = ? AND id = ?", portal, org, id).Find(&rows).Error; err != nil {
 		return nil, err
 	}
 	if len(rows) == 0 {
@@ -130,9 +141,9 @@ func (store) lockRole(ctx context.Context, portal string, id uint64) (*Role, err
 	return &out, nil
 }
 
-func (store) roleByCode(ctx context.Context, portal, code string) (*Role, error) {
+func (store) roleByCode(ctx context.Context, portal string, org uint64, code string) (*Role, error) {
 	var r roleRow
-	err := db.From(ctx).Where("portal = ? AND code = ?", portal, code).First(&r).Error
+	err := db.From(ctx).Where("portal = ? AND org_id = ? AND code = ?", portal, org, code).First(&r).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, ErrRoleNotFound
 	}
@@ -152,9 +163,9 @@ func (store) createRole(ctx context.Context, r *Role) error {
 	return err
 }
 
-func (store) updateRole(ctx context.Context, portal string, id uint64, fields map[string]any) error {
+func (store) updateRole(ctx context.Context, portal string, org, id uint64, fields map[string]any) error {
 	fields["updated_at"] = time.Now().UTC()
-	res := db.From(ctx).Model(&roleRow{}).Where("portal = ? AND id = ?", portal, id).Updates(fields)
+	res := db.From(ctx).Model(&roleRow{}).Where("portal = ? AND org_id = ? AND id = ?", portal, org, id).Updates(fields)
 	if res.Error != nil {
 		return res.Error
 	}
@@ -164,8 +175,8 @@ func (store) updateRole(ctx context.Context, portal string, id uint64, fields ma
 	return nil
 }
 
-func (store) deleteRole(ctx context.Context, portal string, id uint64) error {
-	return db.From(ctx).Where("portal = ? AND id = ?", portal, id).Delete(&roleRow{}).Error
+func (store) deleteRole(ctx context.Context, portal string, org, id uint64) error {
+	return db.From(ctx).Where("portal = ? AND org_id = ? AND id = ?", portal, org, id).Delete(&roleRow{}).Error
 }
 
 // roleUserCountLocked 用锁定读（FOR SHARE）数角色被多少用户引用：数的是最新已提交的分配，不受事务快照影响；删角色前在锁内用它。
@@ -175,21 +186,23 @@ func (store) roleUserCountLocked(ctx context.Context, portal string, roleID uint
 	return n, err
 }
 
-func (store) userRoles(ctx context.Context, portal string, userID uint64) ([]Role, error) {
-	return store{}.userRolesQ(ctx, portal, userID, false)
+func (store) userRoles(ctx context.Context, portal string, org, userID uint64) ([]Role, error) {
+	return store{}.userRolesQ(ctx, portal, org, userID, false)
 }
 
 // userRolesLocked 是 userRoles 的锁定读（FOR SHARE）：锁内做判断用。锁定读拿到的是最新已提交的行，
 // 不受事务快照影响——调用方的事务可能在拿超管锁之前就做过读、快照早已建立（D-043）。
-func (store) userRolesLocked(ctx context.Context, portal string, userID uint64) ([]Role, error) {
-	return store{}.userRolesQ(ctx, portal, userID, true)
+func (store) userRolesLocked(ctx context.Context, portal string, org, userID uint64) ([]Role, error) {
+	return store{}.userRolesQ(ctx, portal, org, userID, true)
 }
 
-func (store) userRolesQ(ctx context.Context, portal string, userID uint64, lock bool) ([]Role, error) {
+// userRolesQ 读用户的角色。只认主体与 org 一致的角色（D-063 第 6 条）：成员关系表本身不带主体，
+// 跨主体的成员关系只可能是被直接写进库的，读出来也不算数。
+func (store) userRolesQ(ctx context.Context, portal string, org, userID uint64, lock bool) ([]Role, error) {
 	var out []roleRow
 	q := db.From(ctx).
 		Joins("JOIN ga_user_role ur ON ur.role_id = ga_role.id AND ur.portal = ga_role.portal").
-		Where("ur.portal = ? AND ur.user_id = ?", portal, userID).
+		Where("ur.portal = ? AND ur.user_id = ? AND ga_role.org_id = ?", portal, userID, org).
 		Order("ga_role.sort ASC, ga_role.id ASC")
 	if lock {
 		q = q.Clauses(clause.Locking{Strength: "SHARE"})
@@ -199,7 +212,7 @@ func (store) userRolesQ(ctx context.Context, portal string, userID uint64, lock 
 }
 
 // userRolesBatch 一次查多个用户的角色（含停用的），供列表页显示。
-func (store) userRolesBatch(ctx context.Context, portal string, userIDs []uint64) (map[uint64][]Role, error) {
+func (store) userRolesBatch(ctx context.Context, portal string, org uint64, userIDs []uint64) (map[uint64][]Role, error) {
 	out := map[uint64][]Role{}
 	if len(userIDs) == 0 {
 		return out, nil
@@ -213,7 +226,7 @@ func (store) userRolesBatch(ctx context.Context, portal string, userIDs []uint64
 	err := db.From(ctx).Table("ga_role").
 		Select("ga_role.*, ur.user_id").
 		Joins("JOIN ga_user_role ur ON ur.role_id = ga_role.id AND ur.portal = ga_role.portal").
-		Where("ur.portal = ? AND ur.user_id IN ?", portal, userIDs).
+		Where("ur.portal = ? AND ur.user_id IN ? AND ga_role.org_id = ?", portal, userIDs, org).
 		Order("ga_role.sort ASC, ga_role.id ASC").Scan(&rows).Error
 	if err != nil {
 		return nil, err
@@ -242,6 +255,16 @@ func (store) replaceUserRoles(ctx context.Context, portal string, userID uint64,
 func (store) usersWithRole(ctx context.Context, portal string, roleID uint64) ([]uint64, error) {
 	var ids []uint64
 	err := db.From(ctx).Model(&userRole{}).Where("portal = ? AND role_id = ?", portal, roleID).Pluck("user_id", &ids).Error
+	return ids, err
+}
+
+// roleMembersLocked 在角色归属内读取全部持有人（包括停用账号），管理资格不沿用旧快照。
+func (store) roleMembersLocked(ctx context.Context, portal string, org, roleID uint64) ([]uint64, error) {
+	var ids []uint64
+	err := db.From(ctx).Table("ga_user_role ur").
+		Joins("JOIN ga_role r ON r.id = ur.role_id AND r.portal = ur.portal").
+		Where("r.portal = ? AND r.org_id = ? AND r.id = ?", portal, org, roleID).
+		Clauses(clause.Locking{Strength: "SHARE"}).Order("ur.user_id").Pluck("ur.user_id", &ids).Error
 	return ids, err
 }
 
@@ -280,9 +303,13 @@ func (store) replaceRolePerms(ctx context.Context, portal string, roleID uint64,
 	return db.From(ctx).Create(&rows).Error
 }
 
-func (store) allPolicies(ctx context.Context) ([]policyRule, error) {
+func (store) allPolicies(ctx context.Context, portals ...string) ([]policyRule, error) {
 	var out []policyRule
-	err := db.From(ctx).Where("ptype = 'p'").Find(&out).Error
+	tx := db.From(ctx).Where("ptype = 'p'")
+	if len(portals) > 0 {
+		tx = tx.Where("v1 IN ?", portals)
+	}
+	err := tx.Find(&out).Error
 	return out, err
 }
 
@@ -334,16 +361,24 @@ func (store) roleScopesQ(ctx context.Context, roleID uint64, lock bool) (map[str
 }
 
 // allRoles 读全部角色（按排序值、ID），授权快照用（D-053）。
-func (store) allRoles(ctx context.Context) ([]Role, error) {
+func (store) allRoles(ctx context.Context, portals ...string) ([]Role, error) {
 	var out []roleRow
-	err := db.From(ctx).Order("sort ASC, id ASC").Find(&out).Error
+	tx := db.From(ctx)
+	if len(portals) > 0 {
+		tx = tx.Where("portal IN ?", portals)
+	}
+	err := tx.Order("sort ASC, id ASC").Find(&out).Error
 	return rolesOf(out), err
 }
 
 // allUserRoles 读全部成员关系，授权快照用（D-053）。
-func (store) allUserRoles(ctx context.Context) ([]userRole, error) {
+func (store) allUserRoles(ctx context.Context, portals ...string) ([]userRole, error) {
 	var out []userRole
-	err := db.From(ctx).Find(&out).Error
+	tx := db.From(ctx)
+	if len(portals) > 0 {
+		tx = tx.Where("portal IN ?", portals)
+	}
+	err := tx.Find(&out).Error
 	return out, err
 }
 

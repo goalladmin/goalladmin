@@ -1,7 +1,9 @@
 <script setup lang="ts">
+import { ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { formatTime, hasPerm, useI18n, useTable } from '@ga/shell'
 
+import IpBlockDialog from '../../../components/IpBlockDialog.vue'
 import { logApi } from '../../../api/system'
 import type { LoginLog } from '../../../api/system'
 
@@ -9,6 +11,9 @@ const { t, te } = useI18n()
 const router = useRouter()
 // 有调查时间线权限时，IP 和会话可以点过去看这条线（D-032）
 const canTimeline = hasPerm('system:audit:timeline')
+// 一键封禁这个来源（D-062）：打开黑名单对话框，IP 已填好
+const canBlock = hasPerm('system:ip:deny')
+const block = ref({ open: false, ip: '' })
 function toTimeline(key: 'ip' | 'sessionId', value: string) {
   if (value) void router.push({ path: '/ops/timeline', query: { [key]: value } })
 }
@@ -72,10 +77,13 @@ function reasonLabel(reason: string) {
         <el-table-column :label="t('sys.loginlog.reason')" min-width="140">
           <template #default="{ row }">{{ reasonLabel((row as LoginLog).reason) }}</template>
         </el-table-column>
-        <el-table-column label="IP" min-width="130">
+        <el-table-column label="IP" min-width="170">
           <template #default="{ row }">
             <el-link v-if="canTimeline && (row as LoginLog).ip" :underline="false" class="ga-mono" @click="toTimeline('ip', (row as LoginLog).ip)">{{ (row as LoginLog).ip }}</el-link>
             <span v-else class="ga-mono">{{ (row as LoginLog).ip }}</span>
+            <el-button v-if="canBlock && (row as LoginLog).ip" link type="danger" size="small" class="ga-log__block" data-test="loginlog-block" @click="block = { open: true, ip: (row as LoginLog).ip }">
+              {{ t('ipacl.block') }}
+            </el-button>
           </template>
         </el-table-column>
         <el-table-column :label="t('ops.secevent.session')" min-width="110">
@@ -107,5 +115,12 @@ function reasonLabel(reason: string) {
         />
       </div>
     </el-card>
+    <IpBlockDialog v-model="block.open" :ip="block.ip" />
   </div>
 </template>
+
+<style scoped>
+.ga-log__block {
+  margin-left: 6px;
+}
+</style>

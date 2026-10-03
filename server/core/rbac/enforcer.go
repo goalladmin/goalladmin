@@ -1,6 +1,7 @@
 package rbac
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -50,28 +51,56 @@ func (a *rowsAdapter) RemoveFilteredPolicy(string, string, int, ...string) error
 
 // enforcer 包一层 casbin。每次重载新建一个，发布后不再修改，判定之间只读。
 type enforcer struct {
-	mu sync.RWMutex
-	e  *casbin.Enforcer
+	mu     sync.RWMutex
+	byRole map[policyKey]*casbin.Enforcer
 }
+
+type policyKey struct{ subject, portal string }
 
 // newEnforcer 用读好的策略行建一个判定器。
 func newEnforcer(rows []policyRule) (*enforcer, error) {
-	m, err := model.NewModelFromString(casbinModel)
-	if err != nil {
-		return nil, fmt.Errorf("rbac: model: %w", err)
+	return newEnforcerContext(context.Background(), rows)
+}
+
+func newEnforcerContext(ctx context.Context, rows []policyRule) (*enforcer, error) {
+	groups := map[policyKey][]policyRule{}
+	for _, row := range rows {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		key := policyKey{row.V0, row.V1}
+		groups[key] = append(groups[key], row)
 	}
-	e, err := casbin.NewEnforcer(m, &rowsAdapter{rows: rows})
-	if err != nil {
-		return nil, fmt.Errorf("rbac: enforcer: %w", err)
+	x := &enforcer{byRole: make(map[policyKey]*casbin.Enforcer, len(groups))}
+	for key, group := range groups {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		m, err := model.NewModelFromString(casbinModel)
+		if err != nil {
+			return nil, fmt.Errorf("rbac: model: %w", err)
+		}
+		e, err := casbin.NewEnforcer(m, &rowsAdapter{rows: group})
+		if err != nil {
+			return nil, fmt.Errorf("rbac: enforcer: %w", err)
+		}
+		e.EnableAutoSave(false)
+		x.byRole[key] = e
 	}
-	e.EnableAutoSave(false)
-	return &enforcer{e: e}, nil
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return x, nil
 }
 
 // allow 判定一个角色在某端是否拥有权限码。
 func (x *enforcer) allow(roleID uint64, portal, perm string) bool {
 	x.mu.RLock()
 	defer x.mu.RUnlock()
-	ok, err := x.e.Enforce(roleSubject(roleID), portal, perm)
+	e := x.byRole[policyKey{roleSubject(roleID), portal}]
+	if e == nil {
+		return false
+	}
+	ok, err := e.Enforce(roleSubject(roleID), portal, perm)
 	return err == nil && ok
 }

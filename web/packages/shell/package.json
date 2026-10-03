@@ -1,12 +1,14 @@
 {
   "name": "@ga/shell",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "GoAllAdmin 前端壳：请求、认证、权限、路由、布局、内置页面、国际化。业务方不改。",
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
-    "./styles": "./src/styles/index.css"
+    "./styles": "./src/styles/index.css",
+    "./vite": "./vite-plugins/index.js",
+    "./eslint": "./eslint/boundary.js"
   },
   "scripts": {
     "lint": "eslint .",
@@ -17,6 +19,7 @@
   "dependencies": {
     "@element-plus/icons-vue": "2.3.2",
     "axios": "1.20.0",
+    "echarts": "6.1.0",
     "element-plus": "2.14.6",
     "flag-icons": "7.5.0",
     "pinia": "3.0.4",

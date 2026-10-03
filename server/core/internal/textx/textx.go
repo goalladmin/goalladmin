@@ -3,6 +3,7 @@ package textx
 
 import (
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -22,4 +23,22 @@ func Clip(s string, n int) string {
 		cut--
 	}
 	return s[:cut]
+}
+
+// HasInvisible 报告 s 里有没有控制字符或不可见的格式字符（零宽空格、从右到左覆盖符、字节顺序标记等），
+// 或者不是合法的 UTF-8。名称类的字段不接受它们（D-099）：后者能做出看起来一样、实际不同的名字。
+// 零宽连接符和零宽非连接符（U+200D、U+200C）除外：孟加拉语、泰米尔语等文字的正常拼写要用到它们。
+func HasInvisible(s string) bool {
+	if !utf8.ValidString(s) {
+		return true
+	}
+	for _, r := range s {
+		if r == '\u200c' || r == '\u200d' {
+			continue
+		}
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return true
+		}
+	}
+	return false
 }

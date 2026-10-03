@@ -79,7 +79,7 @@ func Fail(c *gin.Context, err error) {
 	}
 	ctx := c.Request.Context()
 	if status >= 500 {
-		logx.From(ctx).ErrorContext(ctx, "request failed", "code", e.Code, "err", err, "path", c.FullPath())
+		logx.From(ctx).ErrorContext(ctx, "request failed", "code", e.Code, "err", logx.ErrorText(err), "path", c.FullPath())
 		c.Set(KeyResponseErr, err)
 	}
 	c.Set(KeyResponseCode, e.Code)

@@ -1,7 +1,8 @@
-// Package loginguard 实现登录防护：限流、失败计数、锁定（规范 §5.7）。进程内实现，v0.1 单实例。
+// Package loginguard 实现登录防护：限流、失败计数、锁定（规范 §5.7）。
 package loginguard
 
 import (
+	"context"
 	"strings"
 	"sync"
 	"time"
@@ -34,11 +35,13 @@ type Guard struct {
 	rate    map[string]*rateWindow // 每分钟固定窗口：按 IP、按账号
 	state   map[string]*record     // 失败与锁定：按"账号 + IP"、按账号
 	lastGC  time.Time
+	shared  *sharedGuard
 }
 
 type rateWindow struct {
-	start time.Time
-	count int
+	start    time.Time
+	count    int
+	reserved int // 共享准入往返期间保留容量；只在 Guard 锁内改动
 }
 
 // record 是一个维度（"账号 + IP"或账号）的失败时间点和锁定截止时间。inflight 是钉住它的在途尝试数。
@@ -75,10 +78,10 @@ func pairKey(username, ip string) string { return "pair:" + username + "@" + rat
 
 // Decision 是登录前的判定结果。
 type Decision struct {
-	RateLimited     bool          // 触发限流（包括容量已满），应返回 429
+	RateLimited     bool          // 来源 IP 触发限流，或容量已满：应返回 429
 	Locked          bool          // 被锁定，应返回 CodeLocked
 	LockedUntil     time.Time     // 锁定截止
-	CaptchaRequired bool          // 需要验证码
+	CaptchaRequired bool          // 需要验证码：策略要求、这个来源失败过几次，或者这个账号的请求超过了每分钟的次数（D-103）
 	RetryAfter      time.Duration // 限流时建议的等待时间
 	// Attempt 是这次被接纳的尝试，只在既没限流也没锁定时非空。调用方必须以 Fail、Succeed 或 Done 结束它
 	// （通常 defer Done）：它钉住的记录在结束前不会被清理。
@@ -90,10 +93,25 @@ type Attempt struct {
 	g          *Guard
 	pair, acct string
 	closed     bool
+	remote     *sharedAttempt
+	// acctWindow 是这次请求记进去的那个账号窗口的起点（没记的为零值）：验证码没过时凭它把这一次退回去（D-103）
+	acctWindow time.Time
 }
 
 // Check 在验证密码之前调用：统计本次请求并给出判定。
 func (g *Guard) Check(username, ip string) Decision {
+	return g.CheckContext(context.Background(), username, ip)
+}
+
+// CheckContext 使用共享计数；未配置 Redis 或本次操作失败时使用本实例的影子。
+func (g *Guard) CheckContext(ctx context.Context, username, ip string) Decision {
+	if g.shared != nil {
+		return g.checkShared(ctx, username, ip)
+	}
+	return g.checkMemory(username, ip)
+}
+
+func (g *Guard) checkMemory(username, ip string) Decision {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	now := g.now()
@@ -110,19 +128,34 @@ func (g *Guard) Check(username, ip string) Decision {
 	if !g.roomLocked(now, []string{ipKey(ip), accountKey(username)}, []string{pairKey(username, ip), accountKey(username)}) {
 		return Decision{RateLimited: true, RetryAfter: time.Minute}
 	}
-	// 限流按请求次数计，先记再判
-	if !g.allowLocked(ipKey(ip), g.policy.IPRatePerMinute, now) || !g.allowLocked(accountKey(username), g.policy.AccountRatePerMinute, now) {
+	// 限流按请求次数计，先记再判。来源超限直接拒绝；账号超限不拒绝，改为这次必须带验证码（D-103）：
+	// 账号的次数是所有来源合计的，据此拒绝等于让任何一个来源都能把这个账号的登录挡住。
+	if !g.allowLocked(ipKey(ip), g.policy.IPRatePerMinute, now) {
 		return Decision{RateLimited: true, RetryAfter: time.Minute}
 	}
+	over := !g.allowLocked(accountKey(username), g.policy.AccountRatePerMinute, now)
 	at := g.pinLocked(username, ip)
+	at.acctWindow = g.rate[accountKey(username)].start
 	return Decision{
-		CaptchaRequired: g.policy.CaptchaAlways || g.failuresLocked(at.pair, now) >= g.policy.CaptchaAfterFailures,
+		CaptchaRequired: over || g.policy.CaptchaAlways || g.failuresLocked(at.pair, now) >= g.policy.CaptchaAfterFailures,
 		Attempt:         at,
 	}
 }
 
 // Admit 为不经过登录限流的密码核对（锁屏解锁）预留失败记录。放不下时返回 nil，调用方应在核对密码之前拒绝。
 func (g *Guard) Admit(username, ip string) *Attempt {
+	return g.AdmitContext(context.Background(), username, ip)
+}
+
+// AdmitContext 只预留失败记录，不占登录请求次数。
+func (g *Guard) AdmitContext(ctx context.Context, username, ip string) *Attempt {
+	if g.shared != nil {
+		return g.admitShared(ctx, username, ip)
+	}
+	return g.admitMemory(username, ip)
+}
+
+func (g *Guard) admitMemory(username, ip string) *Attempt {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	now := g.now()
@@ -151,8 +184,8 @@ func (g *Guard) pinLocked(username, ip string) *Attempt {
 func (a *Attempt) Fail() (captchaRequired, locked bool) {
 	g := a.g
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	if a.closed {
+		g.mu.Unlock()
 		return false, false
 	}
 	now := g.now()
@@ -170,20 +203,32 @@ func (a *Attempt) Fail() (captchaRequired, locked bool) {
 		locked = true
 	}
 	a.releaseLocked()
-	return g.policy.CaptchaAlways || pair >= g.policy.CaptchaAfterFailures, locked
+	captchaRequired = g.policy.CaptchaAlways || pair >= g.policy.CaptchaAfterFailures
+	g.mu.Unlock()
+	if a.remote != nil {
+		if result, ok := a.remote.finish("fail", now); ok {
+			return result.captcha, result.locked
+		}
+	}
+	return captchaRequired, locked
 }
 
 // Succeed 登录成功：清掉该账号 + IP 的失败计数和锁定（账号级累计计数保留，防止用成功登录洗掉分布式尝试）。
 func (a *Attempt) Succeed() {
 	g := a.g
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	if a.closed {
+		g.mu.Unlock()
 		return
 	}
 	r := g.state[a.pair]
 	r.fails, r.until = nil, time.Time{}
 	a.releaseLocked()
+	now := g.now()
+	g.mu.Unlock()
+	if a.remote != nil {
+		a.remote.finish("succeed", now)
+	}
 }
 
 // Done 结束尝试而不记结果（验证码不对、出错）。可以 defer，在 Fail、Succeed 之后调用不再有作用；nil 也可以调用。
@@ -192,9 +237,39 @@ func (a *Attempt) Done() {
 		return
 	}
 	a.g.mu.Lock()
-	defer a.g.mu.Unlock()
-	if !a.closed {
-		a.releaseLocked()
+	if a.closed {
+		a.g.mu.Unlock()
+		return
+	}
+	a.releaseLocked()
+	now := a.g.now()
+	a.g.mu.Unlock()
+	if a.remote != nil {
+		a.remote.finish("done", now)
+	}
+}
+
+// CaptchaFailed 结束一次没通过验证码的尝试：不记失败，并把它占的那一次账号请求次数退回去（D-103）——
+// 账号的次数超限之后要验证码，没过验证码的请求如果也算数，不解验证码的人照样能让这个账号的每次登录都要验证码。
+// 来源 IP 的次数不退。nil 也可以调用；在别的结束方法之后调用不再有作用。
+func (a *Attempt) CaptchaFailed() {
+	if a == nil {
+		return
+	}
+	g := a.g
+	g.mu.Lock()
+	if a.closed {
+		g.mu.Unlock()
+		return
+	}
+	if w := g.rate[a.acct]; w != nil && !a.acctWindow.IsZero() && w.start.Equal(a.acctWindow) && w.count > 0 {
+		w.count--
+	}
+	a.releaseLocked()
+	now := g.now()
+	g.mu.Unlock()
+	if a.remote != nil {
+		a.remote.finish("refund", now)
 	}
 }
 
@@ -211,7 +286,7 @@ func (a *Attempt) releaseLocked() {
 	}
 }
 
-// Unlock 管理员解锁账号：清掉账号和它所有"账号 + IP"的失败计数与锁定。
+// Unlock 清掉本实例账号和它所有"账号 + IP"的失败计数与锁定。
 func (g *Guard) Unlock(username string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -229,7 +304,11 @@ func (g *Guard) Unlock(username string) {
 func (g *Guard) allowLocked(key string, limit int, now time.Time) bool {
 	w := g.rate[key]
 	if w == nil || now.Sub(w.start) >= time.Minute {
-		g.rate[key] = &rateWindow{start: now, count: 1}
+		reserved := 0
+		if w != nil {
+			reserved = w.reserved
+		}
+		g.rate[key] = &rateWindow{start: now, count: 1, reserved: reserved}
 		return true
 	}
 	w.count++
@@ -323,7 +402,7 @@ func (g *Guard) gcLocked(now time.Time, force bool) {
 	}
 	g.lastGC = now
 	for k, w := range g.rate {
-		if now.Sub(w.start) >= time.Minute {
+		if w.reserved == 0 && now.Sub(w.start) >= time.Minute {
 			delete(g.rate, k)
 		}
 	}

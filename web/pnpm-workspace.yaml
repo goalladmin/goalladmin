@@ -1,8 +1,10 @@
+# 三个端的应用都在 apps/ 下（platform、agent、merchant，D-064），共用 packages/shell；一份锁文件。
+# 不需要某个端时删掉 apps/<端> 目录、再跑一次 pnpm install 更新锁文件即可。
 packages:
   - packages/*
   - apps/*
 
-# 工作区内的包按版本号互相引用（apps/platform 依赖 "@ga/shell": "0.1.0"），pnpm 和 npm 都会链接到本地目录。
+# 工作区内的包按版本号互相引用（apps/platform 依赖 "@ga/shell": "0.2.0"），pnpm 和 npm 都会链接到本地目录。
 linkWorkspacePackages: true
 
 # 供应链：不安装发布不足 7 天的版本（单位：分钟）。规范 §2。npm 没有对应设置，用 npm 时以锁定的精确版本为准。

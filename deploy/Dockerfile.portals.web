@@ -1,0 +1,22 @@
+# 三套前端分别构建，只有最终静态文件进入 nginx 镜像。
+FROM node:22-alpine AS build
+WORKDIR /src
+RUN corepack enable
+COPY web/pnpm-workspace.yaml web/pnpm-lock.yaml web/package.json web/.npmrc ./
+RUN pnpm fetch
+COPY web/ .
+RUN pnpm install --offline --frozen-lockfile
+RUN pnpm --filter @ga/platform --filter @ga/agent --filter @ga/merchant build
+
+FROM nginx:1.30-alpine
+COPY deploy/nginx.portals.conf.template /etc/nginx/templates/default.conf.template
+COPY deploy/nginx.portals.common.conf /etc/nginx/snippets/portals-common.conf
+COPY deploy/15-check-portal-hosts.sh /docker-entrypoint.d/15-check-portal-hosts.sh
+RUN chmod +x /docker-entrypoint.d/15-check-portal-hosts.sh
+ENV GA_PLATFORM_HOST=platform.localhost GA_AGENT_HOST=agent.localhost GA_MERCHANT_HOST=merchant.localhost
+ENV NGINX_ENVSUBST_FILTER="^GA_(PLATFORM|AGENT|MERCHANT)_HOST$"
+COPY --from=build /src/apps/platform/dist /usr/share/nginx/html/platform
+COPY --from=build /src/apps/agent/dist /usr/share/nginx/html/agent
+COPY --from=build /src/apps/merchant/dist /usr/share/nginx/html/merchant
+COPY LICENSE NOTICE /licenses/
+EXPOSE 80

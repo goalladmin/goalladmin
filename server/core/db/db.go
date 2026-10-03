@@ -50,6 +50,8 @@ func Open(cfg conf.Database, log *slog.Logger) (*gorm.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("db: open: %w", err)
 	}
+	// 程序启动时 conf.Validate 已经拒绝了不是正数的上限（D-069：database/sql 把 0 和负数当成"不限"）；
+	// 这里的判断只是给直接调用 Open 的代码留的（没给上限时保持 database/sql 的默认行为）
 	if cfg.MaxOpenConns > 0 {
 		sqlDB.SetMaxOpenConns(cfg.MaxOpenConns)
 	}
@@ -206,6 +208,18 @@ func InTx(ctx context.Context) bool {
 // Tx 在事务里执行 fn。fn 返回错误或 panic 时回滚，否则提交。
 // 如果 ctx 已在事务里，fn 直接加入该事务（不开新事务，不单独提交）。
 func Tx(ctx context.Context, fn func(ctx context.Context) error) error {
+	return tx(ctx, nil, fn)
+}
+
+// TxReadCommitted 和 Tx 相同，但新开的事务用 READ COMMITTED 隔离级别（D-063）：锁定读和按条件的删除只锁命中的行、
+// 不锁行之间的间隙。用在"已经有一把行锁把同类写操作串起来"的地方——比如主体端的授权写操作在主体行的排他锁里串行，
+// 不同主体的写操作碰的是不同的行，可重复读下的间隙锁却会让它们在同一张表里互相等待、甚至死锁。
+// ctx 已在事务里时加入该事务，隔离级别沿用外层的。
+func TxReadCommitted(ctx context.Context, fn func(ctx context.Context) error) error {
+	return tx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted}, fn)
+}
+
+func tx(ctx context.Context, opts *sql.TxOptions, fn func(ctx context.Context) error) error {
 	if InTx(ctx) {
 		return fn(ctx)
 	}
@@ -220,11 +234,15 @@ func Tx(ctx context.Context, fn func(ctx context.Context) error) error {
 			f(committed)
 		}
 	}()
+	var txOpts []*sql.TxOptions
+	if opts != nil {
+		txOpts = append(txOpts, opts)
+	}
 	err := base.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		ctx := context.WithValue(ctx, txKey{}, tx)
 		ctx = context.WithValue(ctx, hooksKey{}, hooks)
 		return fn(ctx)
-	})
+	}, txOpts...)
 	if err != nil {
 		return err
 	}
@@ -363,7 +381,7 @@ func (l *slogLogger) Trace(ctx context.Context, begin time.Time, fc func() (stri
 	switch {
 	case err != nil && !errors.Is(err, gorm.ErrRecordNotFound) && l.level >= gormlogger.Error:
 		sql, rows := fc()
-		l.log.ErrorContext(ctx, "sql error", "err", err, "elapsed_ms", elapsed.Milliseconds(), "rows", rows, "sql", sqlForLog(sql), "src", utils.FileWithLineNum())
+		l.log.ErrorContext(ctx, "sql error", "err", sqlErrorForLog(err), "elapsed_ms", elapsed.Milliseconds(), "rows", rows, "sql", sqlForLog(sql), "src", utils.FileWithLineNum())
 	case elapsed > l.slowThreshold && l.level >= gormlogger.Warn:
 		sql, rows := fc()
 		l.log.WarnContext(ctx, "slow sql", "elapsed_ms", elapsed.Milliseconds(), "rows", rows, "sql", sqlForLog(sql), "src", utils.FileWithLineNum())

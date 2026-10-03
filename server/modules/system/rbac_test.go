@@ -68,7 +68,7 @@ func newFixtureOpts(t *testing.T, tweak func(cfg *conf.Config), opts ...app.Opti
 	if tweak != nil {
 		tweak(cfg)
 	}
-	opts = append([]app.Option{app.WithDB(gdb), app.WithLogger(logx.New("error", "text", io.Discard)), app.WithBcryptCost(4)}, opts...)
+	opts = append([]app.Option{app.WithDB(gdb), app.WithLogger(logx.New("error", "text", io.Discard)), app.WithPasswordHashParams(64, 1)}, opts...)
 	a, err := app.New(cfg, opts...)
 	require.NoError(t, err)
 	a.Register(system.Module())
@@ -368,12 +368,17 @@ func TestRBAC_17_UnregisteredPolicyHasNoEffect(t *testing.T) {
 	me := f.do(bob, "GET", "/auth/me", nil)
 	require.Equal(t, []any{system.PermUserList}, me.data()["perms"], "未注册的码不出现在 perms 里")
 
+	// 别的程序的端（D-061：代理商、商户是另外的程序）的策略，这个进程不认识它的权限码，也不能删
+	require.NoError(t, gdb.Exec("INSERT INTO ga_casbin_rule (ptype, v0, v1, v2) VALUES ('p', 'role:999999', 'merchant', 'merchant:order:list')").Error)
+
 	n, err := f.app.Deps().RBAC.Prune(ctx)
 	require.NoError(t, err)
 	require.Equal(t, 1, n)
 	var left int64
 	require.NoError(t, gdb.Raw("SELECT COUNT(*) FROM ga_casbin_rule WHERE v2 = 'ghost:thing:do'").Scan(&left).Error)
 	require.EqualValues(t, 0, left)
+	require.NoError(t, gdb.Raw("SELECT COUNT(*) FROM ga_casbin_rule WHERE v1 = 'merchant'").Scan(&left).Error)
+	require.EqualValues(t, 1, left, "没注册的端的策略不归这个进程清理")
 	require.Equal(t, 200, f.do(bob, "GET", "/system/users", nil).rec.Code, "已注册的授权不受影响")
 }
 

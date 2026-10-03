@@ -12,6 +12,7 @@ import (
 
 	"github.com/goalladmin/goalladmin/server/core/db"
 	"github.com/goalladmin/goalladmin/server/core/httpx"
+	"github.com/goalladmin/goalladmin/server/core/internal/textx"
 )
 
 // 本文件是字典的管理操作，供系统管理模块的接口调用。规则见 D-023：
@@ -294,6 +295,9 @@ func (s *Service) dictFields(portal, name string, nameI18n map[string]string, so
 	if name == "" || len([]rune(name)) > maxNameLen {
 		return dictRow{}, field("name", "common.lengthRange", fmt.Sprintf("1-%d chars", maxNameLen), "min", 1, "max", maxNameLen)
 	}
+	if err := invisibleIn("name", name, "nameI18n", nameI18n); err != nil {
+		return dictRow{}, err
+	}
 	ni, err := encodeI18n(nameI18n, maxNameLen)
 	if err != nil {
 		return dictRow{}, field("nameI18n", "dict.i18n", "invalid translations", "detail", err.Error())
@@ -366,11 +370,29 @@ func (s *Service) DeleteDict(ctx context.Context, id uint64) error {
 	})
 }
 
+// invisibleIn 检查后台写入的显示文字（主字段和各语言的文字）有没有控制字符或不可见的格式字符（D-099）。
+// 只在后台写入时检查：代码声明的字典走 Sync，不经过这里。
+func invisibleIn(mainField, main, i18nField string, i18n map[string]string) error {
+	const msg = "must not contain control or invisible characters"
+	if textx.HasInvisible(main) {
+		return field(mainField, "org.textChars", msg)
+	}
+	for _, v := range i18n {
+		if textx.HasInvisible(v) {
+			return field(i18nField, "org.textChars", msg)
+		}
+	}
+	return nil
+}
+
 // itemFields 校验项的显示字段。
 func itemFields(label string, labelI18n map[string]string, color, extra string, sort int, remark string) (itemRow, error) {
 	label = strings.TrimSpace(label)
 	if label == "" || len([]rune(label)) > maxLabelLen {
 		return itemRow{}, field("label", "common.lengthRange", fmt.Sprintf("1-%d chars", maxLabelLen), "min", 1, "max", maxLabelLen)
+	}
+	if err := invisibleIn("label", label, "labelI18n", labelI18n); err != nil {
+		return itemRow{}, err
 	}
 	li, err := encodeI18n(labelI18n, maxLabelLen)
 	if err != nil {

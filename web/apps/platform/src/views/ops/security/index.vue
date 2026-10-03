@@ -1,21 +1,32 @@
 <script setup lang="ts">
 // 安全事件（D-032）：越权被拒、令牌异常、凭证重放等攻击迹象，只读。
-// 地址栏可以带 ip、userId、sessionId、kind 过滤，别的页面据此跳过来。
+// 地址栏可以带 ip、userId、sessionId、kind 过滤，别的页面据此跳过来。可以选看代理商端、商户端的（D-066）。
+import { ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { formatTime, hasPerm, useI18n, useTable } from '@ga/shell'
 
+import IpBlockDialog from '../../../components/IpBlockDialog.vue'
+import PortalSelect from '../../../components/PortalSelect.vue'
 import { logApi, securityKinds } from '../../../api/system'
 import type { SecurityEvent } from '../../../api/system'
+import { opsPortals } from '../../../api/partner'
+import type { OpsPortal } from '../../../api/partner'
 
 const { t, te } = useI18n()
 const route = useRoute()
 const router = useRouter()
 const canTimeline = hasPerm('system:audit:timeline')
+// 一键封禁这个来源（D-062）：打开黑名单对话框，IP 已填好
+const canBlock = hasPerm('system:ip:deny')
+const block = ref({ open: false, ip: '' })
+// 时间线按同一个端查（D-066）
 function toTimeline(key: 'ip' | 'userId' | 'sessionId', value: string | number) {
-  if (value) void router.push({ path: '/ops/timeline', query: { [key]: String(value) } })
+  const portal = table.query.portal === 'platform' ? {} : { portal: table.query.portal }
+  if (value) void router.push({ path: '/ops/timeline', query: { ...portal, [key]: String(value) } })
 }
 
 interface Q extends Record<string, unknown> {
+  portal: OpsPortal
   kind: string
   level: number | undefined
   username: string
@@ -26,9 +37,10 @@ interface Q extends Record<string, unknown> {
 }
 
 const q = (k: string) => (typeof route.query[k] === 'string' ? (route.query[k] as string) : '')
+const routePortal = (opsPortals as readonly string[]).includes(q('portal')) ? (q('portal') as OpsPortal) : 'platform'
 
 const table = useTable<Q, SecurityEvent>({
-  query: { kind: q('kind'), level: undefined, username: '', ip: q('ip'), sessionId: q('sessionId'), userId: q('userId'), range: null },
+  query: { portal: routePortal, kind: q('kind'), level: undefined, username: '', ip: q('ip'), sessionId: q('sessionId'), userId: q('userId'), range: null },
   fetch: ({ range, userId, ...rest }) =>
     logApi.security({
       ...rest,
@@ -55,6 +67,9 @@ const levelLabel = (l: number) => t(l >= 3 ? 'ops.secevent.critical' : l === 2 ?
     <el-alert :title="t('ops.secevent.hint')" type="info" :closable="false" show-icon />
     <el-card>
       <el-form class="ga-toolbar" :inline="true" @submit.prevent="table.search()">
+        <el-form-item :label="t('ops.portal.label')">
+          <PortalSelect v-model="table.query.portal" @update:model-value="table.search()" />
+        </el-form-item>
         <el-form-item :label="t('ops.secevent.level')">
           <el-select v-model="table.query.level" clearable :placeholder="t('common.all')" style="width: 130px" data-test="secevent-level">
             <el-option :value="2" :label="t('ops.secevent.warningUp')" />
@@ -110,12 +125,15 @@ const levelLabel = (l: number) => t(l >= 3 ? 'ops.secevent.critical' : l === 2 ?
             <span v-else class="ga-sec__muted">-</span>
           </template>
         </el-table-column>
-        <el-table-column label="IP" min-width="120">
+        <el-table-column label="IP" min-width="170">
           <template #default="{ row }">
             <el-link v-if="canTimeline && (row as SecurityEvent).ip" :underline="false" class="ga-mono" data-test="secevent-ip" @click="toTimeline('ip', (row as SecurityEvent).ip)">
               {{ (row as SecurityEvent).ip }}
             </el-link>
             <span v-else class="ga-mono">{{ (row as SecurityEvent).ip }}</span>
+            <el-button v-if="canBlock && (row as SecurityEvent).ip" link type="danger" size="small" class="ga-sec__block" data-test="secevent-block" @click="block = { open: true, ip: (row as SecurityEvent).ip }">
+              {{ t('ipacl.block') }}
+            </el-button>
           </template>
         </el-table-column>
         <el-table-column :label="t('ops.secevent.session')" min-width="100">
@@ -152,11 +170,15 @@ const levelLabel = (l: number) => t(l >= 3 ? 'ops.secevent.critical' : l === 2 ?
         />
       </div>
     </el-card>
+    <IpBlockDialog v-model="block.open" :ip="block.ip" />
   </div>
 </template>
 
 <style scoped>
 .ga-sec__muted {
   color: var(--el-text-color-secondary);
+}
+.ga-sec__block {
+  margin-left: 6px;
 }
 </style>

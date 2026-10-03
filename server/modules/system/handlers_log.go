@@ -11,20 +11,14 @@ import (
 	"github.com/goalladmin/goalladmin/server/core/auth"
 	"github.com/goalladmin/goalladmin/server/core/httpx"
 	"github.com/goalladmin/goalladmin/server/core/oplog"
+	"github.com/goalladmin/goalladmin/server/core/org"
 )
 
 // ---- 操作日志、登录日志（只读；规范 §10：只增不改，不提供更新和删除接口）----
 
-// queryTime 解析 RFC 3339 时间参数；空串或格式错误都当作没传。
+// queryTime 解析 RFC 3339 时间参数；空串、格式错误、换算成 UTC 后年份超出 1–9999 的都当作没传（D-099）。
 func queryTime(c *gin.Context, key string) time.Time {
-	s := c.Query(key)
-	if s == "" {
-		return time.Time{}
-	}
-	t, err := time.Parse(time.RFC3339, s)
-	if err != nil {
-		return time.Time{}
-	}
+	t, _ := httpx.ParseTime(c.Query(key))
 	return t
 }
 
@@ -89,12 +83,37 @@ func (h *handlers) listLoginLogs(c *gin.Context) {
 	httpx.OKPage(c, rows, total, q.Page, q.PageSize)
 }
 
+// ---- 运维中心按"端"筛选（D-066）----
+
+// opsPortal 报告 code 是不是平台的运维中心能看的端：平台端，以及和平台共用一个库的代理商端、商户端（平台是三个程序的运营方）。
+// 别的端（业务方自己加的、或者库里来历不明的）照旧按 D-050 当作看不到。
+func opsPortal(code string) bool {
+	return code == PortalCode || code == org.Agent().Portal() || code == org.Merchant().Portal()
+}
+
+// queryPortal 读 portal 参数：不传是平台端；不是能看的端回字段校验失败。
+func queryPortal(c *gin.Context) (string, bool) {
+	p := c.Query("portal")
+	if p == "" {
+		return PortalCode, true
+	}
+	if !opsPortal(p) {
+		httpx.Fail(c, httpx.ErrValidation.WithFields(httpx.NewField("portal", "audit.portal", "unknown portal")))
+		return "", false
+	}
+	return p, true
+}
+
 // ---- 错误日志（D-032，只读）----
 
 func (h *handlers) listErrorLogs(c *gin.Context) {
 	q := httpx.BindPage(c)
-	// 只看本端的错误，外加不属于任何端的（D-050）：别的端的用户名、会话、调用栈不给本端的管理员看
-	f := audit.ErrorFilter{Portal: PortalCode, IncludeGlobal: true, Kind: c.Query("kind"), Route: c.Query("route"), From: queryTime(c, "from"), To: queryTime(c, "to")}
+	p, ok := queryPortal(c)
+	if !ok {
+		return
+	}
+	// 只看选中的那个端的错误；平台端外加不属于任何端的（D-050）。别的端（opsPortal 之外）的用户名、会话、调用栈看不到
+	f := audit.ErrorFilter{Portal: p, IncludeGlobal: p == PortalCode, Kind: c.Query("kind"), Route: c.Query("route"), From: queryTime(c, "from"), To: queryTime(c, "to")}
 	rows, total, err := h.deps.Audit.ListErrors(c.Request.Context(), f, q.Page, q.PageSize)
 	if err != nil {
 		httpx.Fail(c, err)
@@ -110,8 +129,8 @@ func (h *handlers) getErrorLog(c *gin.Context) {
 		return
 	}
 	row, err := h.deps.Audit.GetError(c.Request.Context(), id)
-	if err == nil && row.Portal != "" && row.Portal != PortalCode {
-		err = audit.ErrNotFound // 别的端的错误：当作不存在（D-050）
+	if err == nil && row.Portal != "" && !opsPortal(row.Portal) {
+		err = audit.ErrNotFound // 运维中心看不到的端的错误：当作不存在（D-050、D-066）
 	}
 	if errors.Is(err, audit.ErrNotFound) {
 		httpx.Fail(c, httpx.ErrNotFound)
@@ -128,10 +147,14 @@ func (h *handlers) getErrorLog(c *gin.Context) {
 
 func (h *handlers) listSecurityEvents(c *gin.Context) {
 	q := httpx.BindPage(c)
+	p, ok := queryPortal(c)
+	if !ok {
+		return
+	}
 	level, _ := strconv.Atoi(c.Query("level"))
 	f := audit.SecurityFilter{
-		Portal:        PortalCode,
-		IncludeGlobal: true, // 命令行清理策略这类不属于任何端的事件也要看得到
+		Portal:        p,
+		IncludeGlobal: p == PortalCode, // 平台端：命令行清理策略这类不属于任何端的事件也要看得到
 		Kind:          c.Query("kind"),
 		MinLevel:      level,
 		UserID:        queryUserID(c),
@@ -152,14 +175,19 @@ func (h *handlers) listSecurityEvents(c *gin.Context) {
 // ---- 调查时间线（D-032）----
 
 func (h *handlers) auditTimeline(c *gin.Context) {
+	p, ok := queryPortal(c)
+	if !ok {
+		return
+	}
 	limit, _ := strconv.Atoi(c.Query("limit"))
 	q := audit.TimelineQuery{
-		Portal:    PortalCode,
-		UserID:    queryUserID(c),
-		IP:        c.Query("ip"),
-		SessionID: c.Query("sessionId"),
-		Cursor:    c.Query("cursor"),
-		Limit:     limit,
+		Portal:        p, // 用户 ID 只在一个端里有意义：先选端，再按用户、IP 或会话查（D-066）
+		IncludeGlobal: p == PortalCode,
+		UserID:        queryUserID(c),
+		IP:            c.Query("ip"),
+		SessionID:     c.Query("sessionId"),
+		Cursor:        c.Query("cursor"),
+		Limit:         limit,
 	}
 	out, err := h.deps.Audit.Timeline(c.Request.Context(), q)
 	if errors.Is(err, audit.ErrBadCursor) {

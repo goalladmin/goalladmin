@@ -108,6 +108,19 @@ export function resolveMessage(obj: unknown, path: string): unknown {
   return resolveMessage(obj[path.slice(0, dot)], path.slice(dot + 1))
 }
 
+/**
+ * 主体端（代理商、商户，D-067）叠在壳文案上的一层：各语言文案里 orgOverride 下的键，比如把错误说明里的
+ * "超级管理员"换成"主账号"（主体端的超管就是本主体的主账号，D-061）。createPortalApp 在 scoped 时用它。
+ */
+export function scopedMessages(): LocaleMessages {
+  const out: LocaleMessages = {}
+  for (const [code, m] of Object.entries(shellMessages)) {
+    const o = m.orgOverride
+    if (isPlainObject(o)) out[code as LocaleCode] = o
+  }
+  return out
+}
+
 // vue-i18n 的消息类型是递归字典；文案在运行期合并，这里按字典断言。
 type Messages = Record<string, Record<string, string>>
 

@@ -10,7 +10,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/crypto/bcrypt"
 
 	"github.com/goalladmin/goalladmin/server/core/httpx"
 	"github.com/goalladmin/goalladmin/server/core/internal/authimpl"
@@ -163,11 +162,10 @@ func TestLock_92_UnlockRechecksPasswordUnderLock(t *testing.T) {
 	access, _ := f.mustLogin("alice", "alice-pass-123")
 	require.Equal(t, 0, f.do("POST", "/auth/lock", nil, bearerOpt(access)).env.Code)
 
-	newHash, err := bcrypt.GenerateFromPassword([]byte("changed-pass-456"), f.cost)
-	require.NoError(t, err)
+	newHash := f.hashOf("changed-pass-456")
 	// 解锁读到账号、核对旧密码之后，改密提交了
 	f.users.mu.Lock()
-	f.users.afterFind = func() { f.users.byID[id].PasswordHash = string(newHash) }
+	f.users.afterFind = func() { f.users.byID[id].PasswordHash = newHash }
 	f.users.mu.Unlock()
 	r := f.do("POST", "/auth/unlock", gin.H{"password": "alice-pass-123"}, bearerOpt(access))
 	require.Equal(t, httpx.CodeValidation, r.env.Code, r.rec.Body.String())

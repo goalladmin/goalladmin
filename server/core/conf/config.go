@@ -5,6 +5,7 @@ package conf
 
 import (
 	"fmt"
+	"net"
 	"strings"
 	"time"
 )
@@ -17,12 +18,21 @@ const (
 
 // Config 是整个进程的配置树。
 type Config struct {
-	Server   Server            `mapstructure:"server"`
-	Database Database          `mapstructure:"database"`
-	Log      Log               `mapstructure:"log"`
-	Migrate  Migrate           `mapstructure:"migrate"`
-	Monitor  Monitor           `mapstructure:"monitor"`
-	Portals  map[string]Portal `mapstructure:"portals"`
+	Onboarding Onboarding        `mapstructure:"onboarding"`
+	Server     Server            `mapstructure:"server"`
+	Database   Database          `mapstructure:"database"`
+	Redis      Redis             `mapstructure:"redis"`
+	Log        Log               `mapstructure:"log"`
+	Migrate    Migrate           `mapstructure:"migrate"`
+	Monitor    Monitor           `mapstructure:"monitor"`
+	Portals    map[string]Portal `mapstructure:"portals"`
+}
+
+// Onboarding 控制主体自助入驻；默认关闭，已有申请仍可审核。
+type Onboarding struct {
+	AgentEnabled    bool   `mapstructure:"agentEnabled"`
+	MerchantEnabled bool   `mapstructure:"merchantEnabled"`
+	MerchantOrigin  string `mapstructure:"merchantOrigin"`
 }
 
 // Monitor 是监控中心的配置（D-030、D-031）。
@@ -50,10 +60,44 @@ type Server struct {
 	// 请求回 503。必须小于 WriteTimeout，超时的响应才来得及写回去。
 	HandlerTimeout  time.Duration `mapstructure:"handlerTimeout"`
 	ShutdownTimeout time.Duration `mapstructure:"shutdownTimeout"`
+	// PasswordParallel 是这个进程同时做密码计算（核对、生成哈希）的上限（D-058、D-070）；0 表示按 CPU 数：
+	// max(8, 4×核数)。每个在算的请求占 19 MiB，进程的内存峰值大约是"上限 × 40 MB"，小内存的机器按这个预留或调小。
+	PasswordParallel int `mapstructure:"passwordParallel"`
+	// PasswordHash 是生成新密码哈希用的算法（D-070、D-072）：argon2id（默认）、bcrypt、pbkdf2-sha256 或 pbkdf2-sha512
+	// （PBKDF2 的两种给有 FIPS 140 要求的部署）。核对不看它——每种算法的哈希都认；换了之后已有的密码照常能用，
+	// 账号登录成功时自动换成新选的算法。
+	PasswordHash string `mapstructure:"passwordHash"`
+}
+
+// 密码哈希算法的取值（server.passwordHash）。
+const (
+	PasswordHashArgon2id     = "argon2id"
+	PasswordHashBcrypt       = "bcrypt"
+	PasswordHashPBKDF2SHA256 = "pbkdf2-sha256" //nolint:gosec // 算法名，不是凭据
+	PasswordHashPBKDF2SHA512 = "pbkdf2-sha512" //nolint:gosec // 算法名，不是凭据
+)
+
+// PasswordHashes 返回 server.passwordHash 可以取的值，默认的在前。
+func PasswordHashes() []string {
+	return []string{PasswordHashArgon2id, PasswordHashBcrypt, PasswordHashPBKDF2SHA256, PasswordHashPBKDF2SHA512}
 }
 
 // IsRelease 报告是否 release 模式。
 func (s Server) IsRelease() bool { return s.Mode == ModeRelease }
+
+// ListensBeyondLoopback 报告 Addr 是不是会接受本机之外的连接：主机部分为空、是 0.0.0.0 / :: 这类地址，
+// 或者是一个非回环的地址。写成 localhost 或回环地址时为 false；解析不了的按"会"算（D-098）。
+func (s Server) ListensBeyondLoopback() bool {
+	host, _, err := net.SplitHostPort(s.Addr)
+	if err != nil {
+		return true
+	}
+	if host == "localhost" {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip == nil || !ip.IsLoopback()
+}
 
 // Database 是 MySQL 连接配置。
 type Database struct {
@@ -73,6 +117,27 @@ type Database struct {
 	WriteTimeout   time.Duration `mapstructure:"writeTimeout"`   // 单次网络写的上限
 	ConnectWait    time.Duration `mapstructure:"connectWait"`    // 启动时等数据库就绪的最长时间；0 表示连不上立即退出
 }
+
+// Redis 是可选的 Redis 连接配置（D-074）。Addr 为空表示不用 Redis：程序和以前一样，每个程序只能跑一个实例。
+// 同一个程序跑多个实例（负载均衡）时必须配；平台、代理商、商户三个程序和它们的所有实例要用同一个 Redis、同一个 KeyPrefix。
+// 服务器最低 6.0。Redis 不可用时程序退回本实例的内存，照常服务。
+type Redis struct {
+	Addr     string `mapstructure:"addr"`     // 主机:端口；空 = 关闭
+	Username string `mapstructure:"username"` // 6.0 起的账号；只设了密码的留空
+	Password string `mapstructure:"password"`
+	DB       int    `mapstructure:"db"`  // 库号，0–255
+	TLS      bool   `mapstructure:"tls"` // 用 TLS 连接，按系统的根证书校验服务器证书
+	// KeyPrefix 加在所有键和频道名前面。几套互不相干的部署共用一个 Redis 时各用各的前缀
+	KeyPrefix string `mapstructure:"keyPrefix"`
+	// ConnectWait 是启动时等 Redis 就绪的最长时间。等不到也照常启动，按不可用处理、后台继续探测
+	ConnectWait time.Duration `mapstructure:"connectWait"`
+}
+
+// Enabled 报告是否配置了 Redis。
+func (r Redis) Enabled() bool { return r.Addr != "" }
+
+// DefaultRedisKeyPrefix 是 redis.keyPrefix 的默认值。
+const DefaultRedisKeyPrefix = "ga:"
 
 // defaultDBParams 是 Params 留空时用的连接参数。
 const defaultDBParams = "charset=utf8mb4&parseTime=true&loc=UTC"
@@ -148,7 +213,7 @@ type PortalLogin struct {
 	AccountLockAfter     int           `mapstructure:"accountLockAfter"`     // 同账号所有 IP 累计失败几次后锁定账号，1–200
 	LockDuration         time.Duration `mapstructure:"lockDuration"`         // 锁定时长，1m–24h
 	IPRatePerMinute      int           `mapstructure:"ipRatePerMinute"`      // 同 IP 每分钟登录请求数，1–600
-	AccountRatePerMinute int           `mapstructure:"accountRatePerMinute"` // 同账号每分钟登录请求数，1–120
+	AccountRatePerMinute int           `mapstructure:"accountRatePerMinute"` // 同账号每分钟登录请求数，1–120；超出后要验证码
 }
 
 // PortalPassword 调整端的密码策略（规范 §5.6，D-024）。"字母加数字"始终要求，这里只能往上加。
@@ -177,6 +242,7 @@ func Default() *Config {
 			WriteTimeout:      60 * time.Second,
 			IdleTimeout:       120 * time.Second,
 			HandlerTimeout:    30 * time.Second,
+			PasswordHash:      PasswordHashArgon2id,
 			ShutdownTimeout:   15 * time.Second,
 		},
 		Database: Database{
@@ -193,6 +259,7 @@ func Default() *Config {
 			ReadTimeout:     30 * time.Second,
 			WriteTimeout:    30 * time.Second,
 		},
+		Redis:   Redis{KeyPrefix: DefaultRedisKeyPrefix, ConnectWait: 5 * time.Second},
 		Log:     Log{Level: "info", Format: "text"},
 		Migrate: Migrate{Auto: true},
 		Monitor: Monitor{Server: true, ServerCache: 2 * time.Second, SecurityCache: 10 * time.Second},

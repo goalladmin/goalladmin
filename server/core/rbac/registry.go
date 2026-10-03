@@ -131,6 +131,20 @@ func (r *Registry) Perm(portal, code string) (Perm, bool) {
 	return p, ok
 }
 
+// RoleViewPerms 返回某端声明了 RoleView 的权限码（D-069），按 Code 排序。
+func (r *Registry) RoleViewPerms(portal string) []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var out []string
+	for _, p := range r.perms {
+		if p.Portal == portal && p.RoleView {
+			out = append(out, p.Code)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // Perms 返回某端的全部权限码，按 Group、Code 排序。
 func (r *Registry) Perms(portal string) []Perm {
 	r.mu.RLock()

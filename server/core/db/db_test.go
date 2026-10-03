@@ -3,6 +3,8 @@ package db_test
 import (
 	"context"
 	"errors"
+	"io/fs"
+	"strings"
 	"testing"
 	"testing/fstest"
 
@@ -209,4 +211,143 @@ func TestAfterEnd_RunsOnCommitRollbackAndPanic(t *testing.T) {
 	})
 	db.AfterEnd(ctx, record)
 	require.Equal(t, []bool{true, false, false, true}, got)
+}
+
+// D-061：不执行迁移的程序启动时只读地核对：不建版本表、不执行 DDL；落后就报 ErrMigrationsPending，库比程序新不算错。
+func TestMigrateCheck_ReadOnlyAndDetectsPending(t *testing.T) {
+	gdb := db.OpenTestDB(t)
+	ctx := db.TestContext(t, gdb)
+	fsys := fstest.MapFS{
+		"m/00001_a.sql": {Data: []byte("CREATE TABLE t_check_a (id int);")},
+		"m/00002_b.sql": {Data: []byte("CREATE TABLE t_check_b (id int);")},
+	}
+	tableExists := func(name string) bool {
+		var n int64
+		require.NoError(t, gdb.Raw("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?", name).Scan(&n).Error)
+		return n > 0
+	}
+
+	// 从没迁移过：报落后，而且不顺手建版本表
+	err := db.MigrateCheck(ctx, gdb, fsys, "m", "t_check_version")
+	require.ErrorIs(t, err, db.ErrMigrationsPending)
+	require.False(t, tableExists("t_check_version"), "核对不能建版本表")
+
+	// 只应用了第一个：报落后，并列出没应用的文件
+	_, err = db.MigrateUp(ctx, gdb, fstest.MapFS{"m/00001_a.sql": fsys["m/00001_a.sql"]}, "m", "t_check_version")
+	require.NoError(t, err)
+	err = db.MigrateCheck(ctx, gdb, fsys, "m", "t_check_version")
+	require.ErrorIs(t, err, db.ErrMigrationsPending)
+	require.ErrorContains(t, err, "00002_b.sql")
+	require.False(t, tableExists("t_check_b"), "核对不能执行迁移")
+
+	// 全部应用：通过
+	_, err = db.MigrateUp(ctx, gdb, fsys, "m", "t_check_version")
+	require.NoError(t, err)
+	require.NoError(t, db.MigrateCheck(ctx, gdb, fsys, "m", "t_check_version"))
+
+	// 库比程序新（平台先升级、多了程序不认识的迁移）：不算落后
+	require.NoError(t, db.MigrateCheck(ctx, gdb, fstest.MapFS{"m/00001_a.sql": fsys["m/00001_a.sql"]}, "m", "t_check_version"))
+}
+
+// 迁移 00013（D-061）可以重跑：再执行一遍不报错，列和唯一键都只有一份。
+func TestMigrate_00013_OrgColumnsRerunnable(t *testing.T) {
+	gdb := db.OpenTestDB(t)
+	ctx := db.TestContext(t, gdb)
+	_, err := db.MigrateUp(ctx, gdb, migrations.Core(), migrations.CoreDir, migrations.CoreTable)
+	require.NoError(t, err)
+	raw, err := fs.ReadFile(migrations.Core(), migrations.CoreDir+"/00013_org.sql")
+	require.NoError(t, err)
+	for _, stmt := range db.SplitStatements(string(raw)) {
+		require.NoError(t, gdb.Exec(stmt).Error)
+	}
+	for _, table := range []string{"ga_session", "ga_login_log", "ga_operation_log", "ga_security_event", "ga_role"} {
+		var n int64
+		require.NoError(t, gdb.Raw("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = 'org_id'", table).Scan(&n).Error)
+		require.EqualValues(t, 1, n, table)
+	}
+	var keys []string
+	require.NoError(t, gdb.Raw("SELECT DISTINCT index_name FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = 'ga_role' AND non_unique = 0 ORDER BY index_name").Scan(&keys).Error)
+	require.Equal(t, []string{"PRIMARY", "uk_role_portal_org_code"}, keys, "角色的唯一键改成 (portal, org_id, code)")
+	// 同一个端里，不同主体可以有同编码的角色；同一主体里不行
+	ins := "INSERT INTO ga_role (portal, org_id, code, name, is_super, status, sort, remark, created_at, updated_at, created_by, updated_by) VALUES ('merchant', ?, 'cashier', 'c', 0, 1, 0, '', UTC_TIMESTAMP(3), UTC_TIMESTAMP(3), 0, 0)"
+	require.NoError(t, gdb.Exec(ins, 1).Error)
+	require.NoError(t, gdb.Exec(ins, 2).Error)
+	require.Error(t, gdb.Exec(ins, 1).Error)
+}
+
+// 迁移 00016（D-070）：把三张账号表的密码哈希列从 100 个字符加宽到 255，已有的哈希原样留着；可以重跑。
+func TestMigrate_00016_PasswordHashWidthRerunnable(t *testing.T) {
+	gdb := db.OpenTestDB(t)
+	ctx := db.TestContext(t, gdb)
+	_, err := db.MigrateUp(ctx, gdb, migrations.Core(), migrations.CoreDir, migrations.CoreTable)
+	require.NoError(t, err)
+	tables := []string{"ga_user", "ga_agent_user", "ga_merchant_user"}
+	width := func(table string) (n int, nullable string) {
+		var col struct {
+			Len      int    `gorm:"column:len"`
+			Nullable string `gorm:"column:nullable"`
+		}
+		require.NoError(t, gdb.Raw("SELECT CHARACTER_MAXIMUM_LENGTH AS len, IS_NULLABLE AS nullable FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = 'password_hash'", table).Scan(&col).Error)
+		return col.Len, col.Nullable
+	}
+	// 回到升级前的样子：100 个字符的列，里面有一份旧的 bcrypt 哈希
+	for _, table := range tables {
+		require.NoError(t, gdb.Exec("ALTER TABLE `"+table+"` MODIFY `password_hash` varchar(100) NOT NULL COMMENT 'bcrypt 哈希'").Error)
+		n, _ := width(table)
+		require.Equal(t, 100, n, table)
+	}
+	old := "$2a$12$Nva5w2RIjIpehq7kK63Y4.w6GcOP7tku6vis2v3MOeUwSWBYO6NKq"
+	require.NoError(t, gdb.Exec("INSERT INTO ga_user (username, password_hash, created_at, updated_at) VALUES ('legacy', ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))", old).Error)
+	long := "$argon2id$v=19$m=65536,t=8,p=4$" + strings.Repeat("A", 86) + "$" + strings.Repeat("B", 86) // 参数、盐、输出都取到上限
+	require.Error(t, gdb.Exec("UPDATE ga_user SET password_hash = ? WHERE username = 'legacy'", long).Error, "升级前的列放不下")
+
+	raw, err := fs.ReadFile(migrations.Core(), migrations.CoreDir+"/00016_password_hash_width.sql")
+	require.NoError(t, err)
+	for range 2 { // 跑两遍：第二遍是重跑
+		for _, stmt := range db.SplitStatements(string(raw)) {
+			require.NoError(t, gdb.Exec(stmt).Error)
+		}
+		for _, table := range tables {
+			n, nullable := width(table)
+			require.Equal(t, 255, n, table)
+			require.Equal(t, "NO", nullable, table)
+		}
+		var got string
+		require.NoError(t, gdb.Raw("SELECT password_hash FROM ga_user WHERE username = 'legacy'").Scan(&got).Error)
+		require.Equal(t, old, got, "已有的哈希原样留着")
+	}
+	require.NoError(t, gdb.Exec("UPDATE ga_user SET password_hash = ? WHERE username = 'legacy'", long).Error, "参数取到上限的哈希也放得下")
+}
+
+// TxReadCommitted（D-063）：新开的事务是 READ COMMITTED——同一事务里的第二次普通读能看到别的连接在第一次读之后提交的行
+// （可重复读看不到）；已在事务里时加入外层事务、沿用外层的隔离级别；提交后的回调照常执行。
+func TestTxReadCommitted_IsolationAndNesting(t *testing.T) {
+	gdb := db.OpenTestDB(t)
+	ctx := db.TestContext(t, gdb)
+	require.NoError(t, db.From(ctx).Exec("CREATE TABLE t_rc (id int PRIMARY KEY)").Error)
+	next := 0
+	// seesLaterCommit 在 ctx 的事务里先读一次，再从另一条连接插入并提交一行，然后再读：看得到返回 true
+	seesLaterCommit := func(ctx context.Context) bool {
+		var before, after int64
+		require.NoError(t, db.From(ctx).Raw("SELECT COUNT(*) FROM t_rc").Scan(&before).Error)
+		next++
+		require.NoError(t, gdb.Exec("INSERT INTO t_rc VALUES (?)", next).Error) // 不在 ctx 的事务里：另一条连接、自动提交
+		require.NoError(t, db.From(ctx).Raw("SELECT COUNT(*) FROM t_rc").Scan(&after).Error)
+		return after > before
+	}
+	ran := false
+	require.NoError(t, db.TxReadCommitted(ctx, func(ctx context.Context) error {
+		require.True(t, db.InTx(ctx))
+		require.True(t, seesLaterCommit(ctx), "READ COMMITTED：每条语句都看最新提交的数据")
+		db.AfterCommit(ctx, func() { ran = true })
+		return nil
+	}))
+	require.True(t, ran)
+	require.NoError(t, db.Tx(ctx, func(ctx context.Context) error {
+		require.False(t, seesLaterCommit(ctx), "对照：Tx 是可重复读")
+		return db.TxReadCommitted(ctx, func(inner context.Context) error {
+			require.False(t, seesLaterCommit(inner), "嵌套时加入外层事务，沿用外层的可重复读")
+			return nil
+		})
+	}))
 }

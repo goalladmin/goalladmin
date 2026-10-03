@@ -1,0 +1,134 @@
+# 独立的三端示例，不和其他 Compose 文件叠加。说明见 docs/guides/portals-deployment.md。
+name: goalladmin-portals
+
+# 标准输出轮转；长期审计保留请另接日志采集（D-092）。
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-backend: &backend
+  logging: *logging
+  environment: &backend-env
+    GA_SERVER_ADDR: 0.0.0.0:8080
+    GA_SERVER_MODE: ${GA_SERVER_MODE:-release}
+    GA_SERVER_TRUSTED_PROXIES: 172.29.0.10
+    GA_SERVER_PASSWORD_HASH: ${GA_SERVER_PASSWORD_HASH:-argon2id}
+    GA_SERVER_PASSWORD_PARALLEL: ${GA_SERVER_PASSWORD_PARALLEL:-0}
+    GA_DB_HOST: mysql
+    GA_DB_PORT: "3306"
+    GA_DB_NAME: goalladmin
+    GA_DB_USER: goalladmin
+    GA_DB_PASSWORD: ${GA_DB_PASSWORD:?set GA_DB_PASSWORD in deploy/.env}
+    GA_DB_CONNECT_WAIT: 60s
+    GA_DB_MAX_OPEN_CONNS: ${GA_DB_MAX_OPEN_CONNS:-20}
+    GA_DB_MAX_IDLE_CONNS: ${GA_DB_MAX_IDLE_CONNS:-5}
+    GA_REDIS_ADDR: ${GA_REDIS_ADDR:-}
+    GA_REDIS_USERNAME: ${GA_REDIS_USERNAME:-}
+    GA_REDIS_PASSWORD: ${GA_REDIS_PASSWORD:-}
+    GA_REDIS_DB: ${GA_REDIS_DB:-0}
+    GA_REDIS_TLS: ${GA_REDIS_TLS:-false}
+    GA_REDIS_KEY_PREFIX: ${GA_REDIS_KEY_PREFIX:-ga:}
+    GA_MIGRATE_AUTO: "false"
+    GA_LOG_FORMAT: json
+    GA_ONBOARDING_AGENT_ENABLED: ${GA_ONBOARDING_AGENT_ENABLED:-false}
+    GA_ONBOARDING_MERCHANT_ENABLED: ${GA_ONBOARDING_MERCHANT_ENABLED:-false}
+    GA_ONBOARDING_MERCHANT_ORIGIN: ${GA_ONBOARDING_MERCHANT_ORIGIN:-}
+  expose: ["8080"]
+  healthcheck:
+    test: ["CMD", "/server", "healthcheck"]
+    interval: 10s
+    timeout: 3s
+    retries: 10
+  restart: unless-stopped
+
+x-platform: &platform
+  <<: *backend
+  image: goalladmin-platform:local
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile.server
+    args: {PORTAL: platform}
+  environment: &platform-env
+    <<: *backend-env
+    GA_JWT_SECRET_PLATFORM: ${GA_JWT_SECRET_PLATFORM:?set GA_JWT_SECRET_PLATFORM in deploy/.env}
+    GA_SERVER_ALLOWED_ORIGINS: ${GA_PLATFORM_ORIGIN:-http://${GA_PLATFORM_HOST:-platform.localhost}:${GA_PORTALS_WEB_PORT:-8000}}
+
+services:
+  mysql:
+    extends:
+      file: docker-compose.yml
+      service: mysql
+
+  migrate:
+    <<: *platform
+    command: ["migrate", "up"]
+    environment:
+      <<: *platform-env
+      GA_REDIS_ADDR: ""
+    depends_on:
+      mysql: {condition: service_healthy}
+    healthcheck: {disable: true}
+    restart: "no"
+
+  platform:
+    <<: *platform
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+
+  agent:
+    <<: *backend
+    image: goalladmin-agent:local
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.server
+      args: {PORTAL: agent}
+    environment:
+      <<: *backend-env
+      GA_JWT_SECRET_AGENT: ${GA_JWT_SECRET_AGENT:?set GA_JWT_SECRET_AGENT in deploy/.env}
+      GA_SERVER_ALLOWED_ORIGINS: ${GA_AGENT_ORIGIN:-http://${GA_AGENT_HOST:-agent.localhost}:${GA_PORTALS_WEB_PORT:-8000}}
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+
+  merchant:
+    <<: *backend
+    image: goalladmin-merchant:local
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.server
+      args: {PORTAL: merchant}
+    environment:
+      <<: *backend-env
+      GA_JWT_SECRET_MERCHANT: ${GA_JWT_SECRET_MERCHANT:?set GA_JWT_SECRET_MERCHANT in deploy/.env}
+      GA_SERVER_ALLOWED_ORIGINS: ${GA_MERCHANT_ORIGIN:-http://${GA_MERCHANT_HOST:-merchant.localhost}:${GA_PORTALS_WEB_PORT:-8000}}
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+
+  web:
+    logging: *logging
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.portals.web
+    environment:
+      GA_PLATFORM_HOST: ${GA_PLATFORM_HOST:-platform.localhost}
+      GA_AGENT_HOST: ${GA_AGENT_HOST:-agent.localhost}
+      GA_MERCHANT_HOST: ${GA_MERCHANT_HOST:-merchant.localhost}
+    ports: ["${GA_PORTALS_WEB_PORT:-8000}:80"]
+    networks:
+      default:
+        ipv4_address: 172.29.0.10
+    depends_on:
+      platform: {condition: service_healthy}
+      agent: {condition: service_healthy}
+      merchant: {condition: service_healthy}
+    restart: unless-stopped
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.29.0.0/24
+
+volumes:
+  mysql-data:

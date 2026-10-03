@@ -16,38 +16,50 @@ import (
 // viper 的 AutomaticEnv 对"配置文件和默认值里都不存在的键"不生效，Unmarshal 会读到空值，
 // 所以这里每个可由环境变量提供的键都显式 BindEnv（规范 §11.1）。
 // 端的 JWT 密钥（GA_JWT_SECRET_<CODE>）是动态键，在 Load 里单独处理。
-var EnvBindings = map[string]string{
-	"server.addr":              "GA_SERVER_ADDR",
-	"server.mode":              "GA_SERVER_MODE",
-	"server.trustedProxies":    "GA_SERVER_TRUSTED_PROXIES",
-	"server.allowedOrigins":    "GA_SERVER_ALLOWED_ORIGINS",
-	"server.maxBodyBytes":      "GA_SERVER_MAX_BODY_BYTES",
-	"server.readHeaderTimeout": "GA_SERVER_READ_HEADER_TIMEOUT",
-	"server.readTimeout":       "GA_SERVER_READ_TIMEOUT",
-	"server.writeTimeout":      "GA_SERVER_WRITE_TIMEOUT",
-	"server.idleTimeout":       "GA_SERVER_IDLE_TIMEOUT",
-	"server.shutdownTimeout":   "GA_SERVER_SHUTDOWN_TIMEOUT",
-	"server.handlerTimeout":    "GA_SERVER_HANDLER_TIMEOUT",
-	"database.host":            "GA_DB_HOST",
-	"database.port":            "GA_DB_PORT",
-	"database.name":            "GA_DB_NAME",
-	"database.user":            "GA_DB_USER",
-	"database.password":        "GA_DB_PASSWORD",
-	"database.params":          "GA_DB_PARAMS",
-	"database.maxOpenConns":    "GA_DB_MAX_OPEN_CONNS",
-	"database.maxIdleConns":    "GA_DB_MAX_IDLE_CONNS",
-	"database.connMaxLifetime": "GA_DB_CONN_MAX_LIFETIME",
-	"database.slowThreshold":   "GA_DB_SLOW_THRESHOLD",
-	"database.connectTimeout":  "GA_DB_CONNECT_TIMEOUT",
-	"database.readTimeout":     "GA_DB_READ_TIMEOUT",
-	"database.writeTimeout":    "GA_DB_WRITE_TIMEOUT",
-	"database.connectWait":     "GA_DB_CONNECT_WAIT",
-	"log.level":                "GA_LOG_LEVEL",
-	"log.format":               "GA_LOG_FORMAT",
-	"migrate.auto":             "GA_MIGRATE_AUTO",
-	"monitor.server":           "GA_MONITOR_SERVER",
-	"monitor.serverCache":      "GA_MONITOR_SERVER_CACHE",
-	"monitor.securityCache":    "GA_MONITOR_SECURITY_CACHE",
+var EnvBindings = map[string]string{ //nolint:gosec // 配置键到环境变量名的对照表，不是凭据
+	"onboarding.agentEnabled":    "GA_ONBOARDING_AGENT_ENABLED",
+	"onboarding.merchantEnabled": "GA_ONBOARDING_MERCHANT_ENABLED",
+	"onboarding.merchantOrigin":  "GA_ONBOARDING_MERCHANT_ORIGIN",
+	"server.addr":                "GA_SERVER_ADDR",
+	"server.mode":                "GA_SERVER_MODE",
+	"server.trustedProxies":      "GA_SERVER_TRUSTED_PROXIES",
+	"server.allowedOrigins":      "GA_SERVER_ALLOWED_ORIGINS",
+	"server.maxBodyBytes":        "GA_SERVER_MAX_BODY_BYTES",
+	"server.readHeaderTimeout":   "GA_SERVER_READ_HEADER_TIMEOUT",
+	"server.readTimeout":         "GA_SERVER_READ_TIMEOUT",
+	"server.writeTimeout":        "GA_SERVER_WRITE_TIMEOUT",
+	"server.idleTimeout":         "GA_SERVER_IDLE_TIMEOUT",
+	"server.shutdownTimeout":     "GA_SERVER_SHUTDOWN_TIMEOUT",
+	"server.handlerTimeout":      "GA_SERVER_HANDLER_TIMEOUT",
+	"server.passwordParallel":    "GA_SERVER_PASSWORD_PARALLEL",
+	"server.passwordHash":        "GA_SERVER_PASSWORD_HASH",
+	"database.host":              "GA_DB_HOST",
+	"database.port":              "GA_DB_PORT",
+	"database.name":              "GA_DB_NAME",
+	"database.user":              "GA_DB_USER",
+	"database.password":          "GA_DB_PASSWORD",
+	"database.params":            "GA_DB_PARAMS",
+	"database.maxOpenConns":      "GA_DB_MAX_OPEN_CONNS",
+	"database.maxIdleConns":      "GA_DB_MAX_IDLE_CONNS",
+	"database.connMaxLifetime":   "GA_DB_CONN_MAX_LIFETIME",
+	"database.slowThreshold":     "GA_DB_SLOW_THRESHOLD",
+	"database.connectTimeout":    "GA_DB_CONNECT_TIMEOUT",
+	"database.readTimeout":       "GA_DB_READ_TIMEOUT",
+	"database.writeTimeout":      "GA_DB_WRITE_TIMEOUT",
+	"database.connectWait":       "GA_DB_CONNECT_WAIT",
+	"redis.addr":                 "GA_REDIS_ADDR",
+	"redis.username":             "GA_REDIS_USERNAME",
+	"redis.password":             "GA_REDIS_PASSWORD",
+	"redis.db":                   "GA_REDIS_DB",
+	"redis.tls":                  "GA_REDIS_TLS",
+	"redis.keyPrefix":            "GA_REDIS_KEY_PREFIX",
+	"redis.connectWait":          "GA_REDIS_CONNECT_WAIT",
+	"log.level":                  "GA_LOG_LEVEL",
+	"log.format":                 "GA_LOG_FORMAT",
+	"migrate.auto":               "GA_MIGRATE_AUTO",
+	"monitor.server":             "GA_MONITOR_SERVER",
+	"monitor.serverCache":        "GA_MONITOR_SERVER_CACHE",
+	"monitor.securityCache":      "GA_MONITOR_SECURITY_CACHE",
 }
 
 // JWTSecretEnvPrefix 是端密钥环境变量的前缀：GA_JWT_SECRET_PLATFORM。
@@ -58,11 +70,23 @@ func JWTSecretEnv(portalCode string) string {
 	return JWTSecretEnvPrefix + strings.ToUpper(portalCode)
 }
 
-// Load 读取配置：默认值 ← YAML 文件 ← 环境变量。
+// Load 读取配置：默认值 ← YAML 文件 ← 环境变量。平台程序用它：配置里写了的端都保留，没写 platform 时补上默认值。
 //
 // path 为空时不读文件（适合容器里只用环境变量的场景）；path 非空但文件不存在时返回错误。
 // Load 不做 release 校验，调用方在需要时调用 Validate。
-func Load(path string) (*Config, error) {
+func Load(path string) (*Config, error) { return load(path, nil) }
+
+// LoadFor 读取只服务某几个端的程序（代理商、商户）的配置（D-061）：只保留 portals 列出的端，配置文件里别的端的段落
+// 连同密钥一起丢掉——别的端的密钥不进这个进程，也不参与 release 模式的密钥检查。列出的端没写配置时补上默认值，
+// 密钥照样从 GA_JWT_SECRET_<端> 读。
+func LoadFor(path string, portals ...string) (*Config, error) {
+	if len(portals) == 0 {
+		return nil, errors.New("conf: LoadFor 至少要列一个端")
+	}
+	return load(path, portals)
+}
+
+func load(path string, only []string) (*Config, error) {
 	v := viper.New()
 	setDefaults(v, "", reflect.ValueOf(*Default()))
 
@@ -86,8 +110,16 @@ func Load(path string) (*Config, error) {
 	if cfg.Portals == nil {
 		cfg.Portals = map[string]Portal{}
 	}
-	if _, ok := cfg.Portals[DefaultPortalCode]; !ok {
-		cfg.Portals[DefaultPortalCode] = Default().Portals[DefaultPortalCode]
+	if only == nil {
+		if _, ok := cfg.Portals[DefaultPortalCode]; !ok {
+			cfg.Portals[DefaultPortalCode] = Default().Portals[DefaultPortalCode]
+		}
+	} else {
+		kept := make(map[string]Portal, len(only))
+		for _, code := range only {
+			kept[code] = cfg.Portals[code] // 没写的是零值，下面补默认的有效期
+		}
+		cfg.Portals = kept
 	}
 	// 端密钥：配置文件里可以写（config.yaml 不进 git），环境变量 GA_JWT_SECRET_<CODE> 优先。
 	for code, p := range cfg.Portals {

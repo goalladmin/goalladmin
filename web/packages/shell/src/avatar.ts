@@ -1,7 +1,7 @@
 // 头像（D-040）：用户的 avatar 只会是三种值——空（显示名字首字母）、preset:<名字>（这里的内置头像）、
 // upload:<键>（本人上传，按键向服务器要图）。内置头像是本项目原创的几何图案，直接在浏览器里生成 SVG，不发请求。
 //
-// 名字表和后端（server/modules/system/avatar.go 的 avatarPresets）是同一份，由那边的测试对齐。
+// 名字表和后端（server/core/portal/avatar.go 的 AvatarPresets，平台端和主体端共用）是同一份，由 server/modules/system 的测试对齐。
 
 import type { Client } from './request/client'
 import { Codes, isApiError } from './types'

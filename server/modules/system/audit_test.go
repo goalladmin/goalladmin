@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -491,4 +492,71 @@ func TestAudit_46b_LoginFloodAndGlobalEvents(t *testing.T) {
 	require.EqualValues(t, 21, r.data()["list"].([]any)[0].(map[string]any)["count"])
 	r = f.do(admin, "GET", "/system/security-events?kind=cli", nil)
 	require.EqualValues(t, 2, r.data()["total"], "建管理员 + 不属于任何端的清理策略")
+}
+
+// 142. 运维中心按"端"筛选（D-066）：不带参数和以前一样只看平台端（错误日志、安全事件外加不属于任何端的）；
+// 选代理商端、商户端只看那个端的（不混进平台端和不属于任何端的），详情看得到；别的端照旧看不到（列表报参数错误、详情 404）；
+// 调查时间线同样先选端。
+func TestAudit_142_OpsCenterPortalFilter(t *testing.T) {
+	f := newFixture(t)
+	admin, _ := f.admin("root")
+	now := time.Now().UTC()
+	for i, portal := range []string{"platform", "", "agent", "merchant", "other"} {
+		require.NoError(t, f.gdb.Exec("INSERT INTO ga_error_log (fingerprint, kind, portal, route, message, count, first_at, last_at) VALUES (?, 'error', ?, '/x', 'x', 1, ?, ?)",
+			fmt.Sprintf("%032d", i), portal, now, now).Error)
+		require.NoError(t, f.gdb.Exec("INSERT INTO ga_security_event (dedup_key, window_start, portal, kind, ip, count, first_at, last_at) VALUES (?, ?, ?, 'forbidden', '192.0.2.77', 1, ?, ?)",
+			fmt.Sprintf("%032d", i), now, portal, now, now).Error)
+		require.NoError(t, f.gdb.Exec("INSERT INTO ga_login_log (portal, username, success, ip, created_at) VALUES (?, ?, 1, '192.0.2.77', ?)", portal, "u-"+portal, now).Error)
+	}
+	portals := func(path string) []string {
+		r := f.do(admin, "GET", path, nil)
+		require.Equal(t, 0, r.env.Code, r.rec.Body.String())
+		list := r.data()["list"].([]any)
+		out := make([]string, 0, len(list))
+		for _, v := range list {
+			out = append(out, v.(map[string]any)["portal"].(string))
+		}
+		sort.Strings(out)
+		return out
+	}
+	// 只看测试造的行（建管理员本身也会记安全事件）
+	for _, base := range []string{"/system/error-logs?route=/x", "/system/security-events?ip=192.0.2.77"} {
+		require.Equal(t, []string{"", "platform"}, portals(base), base+"：默认和以前一样")
+		require.Equal(t, []string{"", "platform"}, portals(base+"&portal=platform"), base)
+		require.Equal(t, []string{"agent"}, portals(base+"&portal=agent"), base)
+		require.Equal(t, []string{"merchant"}, portals(base+"&portal=merchant"), base)
+		r := f.do(admin, "GET", base+"&portal=other", nil)
+		require.Equal(t, httpx.CodeValidation, r.env.Code, base+"：别的端看不到")
+	}
+	idOf := func(portal string) uint64 {
+		var id uint64
+		require.NoError(t, f.gdb.Raw("SELECT id FROM ga_error_log WHERE portal = ?", portal).Scan(&id).Error)
+		return id
+	}
+	require.Equal(t, 0, f.do(admin, "GET", fmt.Sprintf("/system/error-logs/%d", idOf("merchant")), nil).env.Code)
+	require.Equal(t, 0, f.do(admin, "GET", fmt.Sprintf("/system/error-logs/%d", idOf("agent")), nil).env.Code)
+	require.Equal(t, 404, f.do(admin, "GET", fmt.Sprintf("/system/error-logs/%d", idOf("other")), nil).rec.Code)
+
+	// 时间线：登录只有选中的端的；安全事件平台端外加不属于任何端的，代理商端、商户端不混进不属于任何端的
+	who := func(qs string) (logins []string, security int) {
+		r := f.do(admin, "GET", "/system/audit/timeline?ip=192.0.2.77"+qs, nil)
+		require.Equal(t, 0, r.env.Code, r.rec.Body.String())
+		for _, it := range r.data()["items"].([]any) {
+			m := it.(map[string]any)
+			switch m["type"] {
+			case "login":
+				logins = append(logins, m["username"].(string))
+			case "security":
+				security++
+			}
+		}
+		return logins, security
+	}
+	logins, security := who("")
+	require.Equal(t, []string{"u-platform"}, logins)
+	require.Equal(t, 2, security, "平台端和不属于任何端的")
+	logins, security = who("&portal=merchant")
+	require.Equal(t, []string{"u-merchant"}, logins)
+	require.Equal(t, 1, security, "只有商户端的")
+	require.Equal(t, httpx.CodeValidation, f.do(admin, "GET", "/system/audit/timeline?ip=192.0.2.77&portal=other", nil).env.Code)
 }

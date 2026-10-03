@@ -40,6 +40,10 @@ const (
 	PermSecEventList   = "system:secevent:list"   // 安全事件（D-032），敏感
 	PermAuditTimeline  = "system:audit:timeline"  // 调查时间线（D-032）：能看到某人、某 IP 的全部动作，敏感
 	PermSecurityView   = "system:security:view"   // 安全设置（D-034）：只读，但含锁定和限流阈值，敏感
+	PermIPList         = "system:ip:list"         // 查看 IP 黑名单和平台端白名单（D-062）
+	PermIPDeny         = "system:ip:deny"         // 加、删 IP 黑名单：三个程序都生效，敏感（D-062）
+	PermIPAllow        = "system:ip:allow"        // 设平台端 IP 白名单：配错能把所有人挡在外面，敏感（D-062）
+	PermUserIP         = "system:user:ip"         // 查看、设置平台账号的 IP 白名单：能把人挡在外面，敏感；目标按查看、修改用户的范围约束（D-062）
 )
 
 // DataUser 是用户数据资源（D-039）：数据所属部门是 ga_user.dept_id，所属的人是用户自己。
@@ -79,6 +83,10 @@ const (
 	OpProfileRevokeOthers = "profile.revoke-others" // 个人中心：本人让其他设备下线（D-038）
 	OpProfileAvatar       = "profile.avatar"        // 个人中心：本人上传、选择或清除头像（D-040）
 	OpUserAvatarClear     = "user.avatar-clear"     // 管理员清除别人的头像（D-040）
+	OpUserIP              = "user.ip"               // 设置平台账号的 IP 白名单（D-062）
+	OpIPDeny              = "ip.deny"               // 加 IP 黑名单（D-062）
+	OpIPUnblock           = "ip.unblock"            // 删 IP 黑名单（D-062）
+	OpIPAllow             = "ip.allow"              // 设平台端 IP 白名单（D-062）
 
 	// 查看审计数据本身也留痕（D-032 第 7 条）：谁在什么时候、按什么条件翻看过
 	OpViewOplog          = "audit.view.oplog"
@@ -91,7 +99,8 @@ const (
 
 func (m *module) Perms() []rbac.Perm {
 	p := func(code, name, group string, sensitive bool) rbac.Perm {
-		return rbac.Perm{Code: code, Name: name, Portal: PortalCode, Group: group, Sensitive: sensitive}
+		// 看角色权限、数据范围的接口由 PermRoleList 守着：有它的人分配角色被拒时看得到细节（D-069）
+		return rbac.Perm{Code: code, Name: name, Portal: PortalCode, Group: group, Sensitive: sensitive, RoleView: code == PermRoleList}
 	}
 	return []rbac.Perm{
 		p(PermUserList, "perm.system.user.list", "system.user", false),
@@ -132,6 +141,10 @@ func (m *module) Perms() []rbac.Perm {
 		p(PermAuditTimeline, "perm.system.audit.timeline", "system.audit", true),
 		// 知道确切的锁定次数和限流阈值，就能把尝试速度压在阈值以下，所以只读也只能由超管授出（D-034）
 		p(PermSecurityView, "perm.system.security.view", "system.security", true),
+		p(PermIPList, "perm.system.ip.list", "system.ip", false),
+		p(PermIPDeny, "perm.system.ip.deny", "system.ip", true),
+		p(PermIPAllow, "perm.system.ip.allow", "system.ip", true),
+		p(PermUserIP, "perm.system.user.ip", "system.user", true),
 	}
 }
 
@@ -162,5 +175,7 @@ func (m *module) Menus() []rbac.MenuNode {
 		{Portal: PortalCode, Name: "settings", Path: "/settings", TitleKey: "menu.settings", Icon: "Tools", Sort: 800},
 		{Portal: PortalCode, Parent: "settings", Name: "system-dict", Path: "/system/dicts", Component: "system/dict/index", TitleKey: "menu.system.dict", Icon: "Collection", Perm: PermDictList, Sort: 10, KeepAlive: true},
 		{Portal: PortalCode, Parent: "settings", Name: "settings-security", Path: "/settings/security", Component: "settings/security/index", TitleKey: "menu.settings.security", Icon: "Lock", Perm: PermSecurityView, Sort: 20}, // 不缓存：每次打开都读最新的生效值
+		// IP 访问控制（D-062）：黑名单和平台端白名单两个页签
+		{Portal: PortalCode, Parent: "settings", Name: "settings-ip", Path: "/settings/ip", Component: "settings/ip/index", TitleKey: "menu.settings.ip", Icon: "Connection", Perm: PermIPList, Sort: 30},
 	}
 }

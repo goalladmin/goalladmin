@@ -1,0 +1,138 @@
+# 同一平台端的两个实例；独立使用此文件，不叠加 docker-compose.yml。
+# 用法、升级顺序与故障边界见 docs/guides/multi-instance.md。
+name: goalladmin-multi
+
+# 标准输出轮转；长期审计保留请另接日志采集（D-092）。
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-server: &server
+  logging: *logging
+  image: goalladmin-server:local
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile.server
+  environment: &server-env
+    GA_SERVER_ADDR: 0.0.0.0:8080
+    GA_SERVER_MODE: ${GA_SERVER_MODE:-release}
+    GA_SERVER_ALLOWED_ORIGINS: ${GA_SERVER_ALLOWED_ORIGINS:-http://localhost:8000}
+    GA_SERVER_TRUSTED_PROXIES: 172.31.0.10
+    GA_SERVER_PASSWORD_HASH: ${GA_SERVER_PASSWORD_HASH:-argon2id}
+    GA_SERVER_PASSWORD_PARALLEL: ${GA_SERVER_PASSWORD_PARALLEL:-0}
+    GA_DB_HOST: mysql
+    GA_DB_PORT: "3306"
+    GA_DB_NAME: goalladmin
+    GA_DB_USER: goalladmin
+    GA_DB_PASSWORD: ${GA_DB_PASSWORD:?set GA_DB_PASSWORD in deploy/.env}
+    GA_DB_CONNECT_WAIT: 60s
+    GA_JWT_SECRET_PLATFORM: ${GA_JWT_SECRET_PLATFORM:?set GA_JWT_SECRET_PLATFORM in deploy/.env}
+    GA_REDIS_ADDR: redis:6379
+    GA_REDIS_PASSWORD: ${GA_REDIS_PASSWORD:?set GA_REDIS_PASSWORD in deploy/.env}
+    GA_REDIS_KEY_PREFIX: ${GA_REDIS_KEY_PREFIX:-ga:}
+    GA_REDIS_CONNECT_WAIT: 5s
+    GA_MIGRATE_AUTO: "false"
+    GA_LOG_FORMAT: json
+  expose:
+    - "8080"
+  healthcheck:
+    test: ["CMD", "/server", "healthcheck"]
+    interval: 10s
+    timeout: 3s
+    retries: 10
+
+services:
+  mysql:
+    logging: *logging
+    # 引擎升级与应用迁移分别安排；旧卷先固定原镜像（D-107）。
+    image: ${GA_MYSQL_IMAGE:-mysql:8.4}
+    environment:
+      MYSQL_ROOT_PASSWORD: ${GA_DB_ROOT_PASSWORD:?set GA_DB_ROOT_PASSWORD in deploy/.env}
+      MYSQL_DATABASE: goalladmin
+      MYSQL_USER: goalladmin
+      MYSQL_PASSWORD: ${GA_DB_PASSWORD}
+      TZ: UTC
+    command: --default-time-zone=+00:00 --character-set-server=utf8mb4 --collation-server=utf8mb4_0900_ai_ci
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  redis:
+    logging: *logging
+    image: redis:8.2-alpine
+    environment:
+      REDISCLI_AUTH: ${GA_REDIS_PASSWORD}
+    # 短期状态；容量不足时报错，由应用降级，避免静默逐出有效验证码和计数。
+    command: ["sh", "-c", "exec redis-server --requirepass \"$$REDISCLI_AUTH\" --save '' --appendonly no --maxmemory 128mb --maxmemory-policy noeviction"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    # 无宿主机端口；本示例网络中的容器均需可信。生产跨主机连接还应启用 TLS。
+
+  migrate:
+    <<: *server
+    command: ["migrate", "up"]
+    environment:
+      <<: *server-env
+      # 迁移只写数据库，不需要 Redis。
+      GA_REDIS_ADDR: ""
+    healthcheck:
+      disable: true
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: "no"
+
+  server-a:
+    <<: *server
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    restart: unless-stopped
+
+  server-b:
+    <<: *server
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    restart: unless-stopped
+
+  web:
+    logging: *logging
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.web
+    volumes:
+      - ./nginx.multi.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      server-a:
+        condition: service_healthy
+      server-b:
+        condition: service_healthy
+    ports:
+      - "${GA_WEB_PORT:-8000}:80"
+    networks:
+      default:
+        ipv4_address: 172.31.0.10
+    restart: unless-stopped
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24
+
+volumes:
+  mysql-data:

@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"testing"
 
+	mysqldrv "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -44,4 +47,17 @@ func TestParseLevel(t *testing.T) {
 	require.Equal(t, slog.LevelWarn, ParseLevel("warning"))
 	require.Equal(t, slog.LevelError, ParseLevel("error"))
 	require.Equal(t, slog.LevelInfo, ParseLevel("whatever"))
+}
+
+func TestDatabaseError_178_RedactedInLogFormats(t *testing.T) {
+	const value = "private-fixture-value"
+	err := fmt.Errorf("context %s: %w", value, &mysqldrv.MySQLError{Number: 1366, Message: value})
+	for _, format := range []string{"json", "text"} {
+		var buf bytes.Buffer
+		New("error", format, &buf).Error("failure", "err", err)
+		require.NotContains(t, buf.String(), value)
+		require.Contains(t, buf.String(), "mysql error 1366")
+	}
+	require.Equal(t, "plain diagnosis", ErrorText(errors.New("plain diagnosis")))
+	require.Contains(t, err.Error(), value)
 }

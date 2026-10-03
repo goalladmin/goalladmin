@@ -40,7 +40,7 @@ func (m *module) Init(deps *app.Deps) error {
 	return deps.Portals.Register(portal.Portal{
 		Code:  PortalCode,
 		Users: NewUserProvider(m.repo),
-		Org:   orgProvider{s: org},
+		Dept:  deptProvider{s: org},
 	})
 }
 
@@ -123,14 +123,24 @@ func (m *module) Routes(r *app.Router) {
 	g.PUT("/profile", rbac.AuthOnly(), h.updateProfile, oplog.Record(OpProfileUpdate))
 	g.POST("/profile/revoke-other-sessions", rbac.AuthOnly(), h.revokeOtherSessions, oplog.Record(OpProfileRevokeOthers))
 	// 头像（D-040）：本人上传、选内置、清除都只改调用者本人；读头像按随机键、要登录；管理员只能清除别人的
-	g.POST("/avatar", rbac.AuthOnly(), h.uploadAvatar, app.WithMiddleware(requireImageBody), oplog.Record(OpProfileAvatar))
+	g.POST("/avatar", rbac.AuthOnly(), h.uploadAvatar, app.WithMiddleware(requireImageBody), app.WithMiddleware(h.admitAvatar), oplog.Record(OpProfileAvatar))
 	g.PUT("/avatar", rbac.AuthOnly(), h.setPresetAvatar, oplog.Record(OpProfileAvatar))
 	g.DELETE("/avatar", rbac.AuthOnly(), h.clearOwnAvatar, oplog.Record(OpProfileAvatar))
 	g.GET("/avatars/:key", rbac.AuthOnly(), h.avatarImage)
 	g.DELETE("/users/:id/avatar", rbac.Require(PermUserUpdate), h.clearUserAvatar, oplog.Record(OpUserAvatarClear))
+	// 平台账号的 IP 白名单（D-062）
+	g.GET("/users/:id/ip-allow", rbac.Require(PermUserIP), h.getUserIPAllow)
+	g.PUT("/users/:id/ip-allow", rbac.Require(PermUserIP), h.setUserIPAllow, oplog.Record(OpUserIP))
 
 	// 安全设置只读（D-034）：策略只能在配置文件里改（D-024），这里没有写接口
 	g.GET("/security-policy", rbac.Require(PermSecurityView), h.securityPolicy)
+
+	// IP 访问控制（D-062）：黑名单对三个程序都生效；平台端白名单只管平台
+	g.GET("/ip-rules/deny", rbac.Require(PermIPList), h.listIPDeny)
+	g.POST("/ip-rules/deny", rbac.Require(PermIPDeny), h.addIPDeny, oplog.Record(OpIPDeny))
+	g.DELETE("/ip-rules/deny/:id", rbac.Require(PermIPDeny), h.removeIPDeny, oplog.Record(OpIPUnblock))
+	g.GET("/ip-rules/allow", rbac.Require(PermIPList), h.getIPAllow)
+	g.PUT("/ip-rules/allow", rbac.Require(PermIPAllow), h.setIPAllow, oplog.Record(OpIPAllow))
 
 	g.GET("/menus", rbac.Require(PermMenuList), h.listMenus)
 	g.PUT("/menu-layout", rbac.Require(PermMenuUpdate), h.saveMenuLayout, oplog.Record(OpMenuLayout))
@@ -223,12 +233,20 @@ func ResetPasswordByCLI(ctx context.Context, deps *app.Deps, username, operator 
 	if err != nil {
 		return nil, err
 	}
+	// 用户表的排序规则不区分大小写和重音：查到的账号名要和输入逐字相同，和登录一样（D-043、D-099），
+	// 不然敲错成另一种写法也会重置到那个账号上
+	if portal.NormalizeUsername(u.Username) != username {
+		return nil, fmt.Errorf("用户 %s 不存在", username)
+	}
 	super, err := deps.RBAC.HoldsSuperRole(ctx, PortalCode, u.ID)
 	if err != nil {
 		return nil, err
 	}
-	plain, err := resetPassword(ctx, deps, repo, u.ID)
+	plain, hash, err := newPassword(deps)
 	if err != nil {
+		return nil, err
+	}
+	if err := setPassword(ctx, deps, repo, u.ID, hash); err != nil {
 		return nil, err
 	}
 	res := &CLIReset{Password: plain, Enabled: u.Status == StatusEnabled, Super: super}

@@ -214,7 +214,7 @@ func TestSuper_ResetPasswordByCLI(t *testing.T) {
 	ctx := f.app.Context(context.Background())
 
 	// 和真实的命令行一样，用另一个应用实例（另一套认证器和缓存）连同一个库
-	cli, err := app.New(f.app.Deps().Conf, app.WithDB(f.gdb), app.WithLogger(logx.New("error", "text", io.Discard)), app.WithBcryptCost(4))
+	cli, err := app.New(f.app.Deps().Conf, app.WithDB(f.gdb), app.WithLogger(logx.New("error", "text", io.Discard)), app.WithPasswordHashParams(64, 1))
 	require.NoError(t, err)
 	cli.Register(system.Module())
 	require.NoError(t, cli.Setup())

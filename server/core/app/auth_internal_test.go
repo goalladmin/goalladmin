@@ -19,7 +19,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 
 	"github.com/goalladmin/goalladmin/server/core/audit"
@@ -73,6 +72,8 @@ type memUsers struct {
 	failNext error
 	// afterFind 在一次 FindByID 取好副本之后调用一次（模拟"读完之后别人提交了修改"）
 	afterFind func()
+	rehashes  int // RehashPassword 被调用的次数
+	finds     int // FindByID 被调用的次数
 }
 
 func newMemUsers() *memUsers {
@@ -112,6 +113,7 @@ func (m *memUsers) FindByUsername(_ context.Context, username string) (*portal.A
 func (m *memUsers) FindByID(_ context.Context, id uint64) (*portal.Account, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.finds++
 	if err := m.failNext; err != nil {
 		m.failNext = nil
 		return nil, err
@@ -130,6 +132,17 @@ func (m *memUsers) FindByID(_ context.Context, id uint64) (*portal.Account, erro
 
 func (m *memUsers) UpdatePasswordHash(_ context.Context, id uint64, hash string, mustChange bool) error {
 	m.set(id, func(a *portal.Account) { a.PasswordHash = hash; a.MustChangePwd = mustChange })
+	return nil
+}
+
+// RehashPassword 只换哈希（portal.PasswordRehasher，D-070）：库里的哈希已经不是 oldHash 时什么都不做。
+func (m *memUsers) RehashPassword(_ context.Context, id uint64, oldHash, newHash string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rehashes++
+	if a := m.byID[id]; a != nil && a.PasswordHash == oldHash {
+		a.PasswordHash = newHash
+	}
 	return nil
 }
 
@@ -161,7 +174,6 @@ type authFixture struct {
 	app   *App
 	users *memUsers
 	clock *fakeClock
-	cost  int
 }
 
 func newAuthFixture(t *testing.T, opts ...Option) *authFixture {
@@ -186,8 +198,9 @@ func newAuthFixtureCfg(t *testing.T, tweak func(cfg *conf.Config), opts ...Optio
 
 	clock := &fakeClock{t: time.Now().UTC().Truncate(time.Second)}
 	users := newMemUsers()
-	f := &authFixture{t: t, users: users, clock: clock, cost: 4}
-	base := []Option{WithDB(gdb), WithLogger(logx.New("error", "text", io.Discard)), WithClock(clock.Now), WithBcryptCost(f.cost)}
+	f := &authFixture{t: t, users: users, clock: clock}
+	// 密码哈希的参数降到最低，测试才跑得快；放在最前面，测试自己传的选项可以盖掉它
+	base := []Option{WithDB(gdb), WithLogger(logx.New("error", "text", io.Discard)), WithClock(clock.Now), WithPasswordHashParams(64, 1)}
 	a, err := New(cfg, append(base, opts...)...)
 	require.NoError(t, err)
 	a.Register(&authTestModule{users: users})
@@ -197,9 +210,14 @@ func newAuthFixtureCfg(t *testing.T, tweak func(cfg *conf.Config), opts ...Optio
 }
 
 func (f *authFixture) addUser(username, password string) uint64 {
-	h, err := bcrypt.GenerateFromPassword([]byte(password), f.cost)
+	return f.users.add(username, f.hashOf(password))
+}
+
+// hashOf 用这个应用的哈希器生成密码哈希（不经过并发闸门）。
+func (f *authFixture) hashOf(password string) string {
+	h, err := f.app.hasher.Hash(password)
 	require.NoError(f.t, err)
-	return f.users.add(username, string(h))
+	return h
 }
 
 type resp struct {
@@ -251,7 +269,7 @@ func (f *authFixture) do(method, path string, body any, opts ...reqOpt) resp {
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	if path == "/auth/login" {
+	if path == "/auth/login" || path == "/auth/captcha" {
 		webClient()(req) // 浏览器里的登录都带这两个头（D-051）；测反例的用 opts 覆盖掉
 	}
 	for _, o := range opts {
@@ -298,8 +316,7 @@ func forgeToken(t *testing.T, method jwt.SigningMethod, key any, claims jwt.MapC
 // ============ 1. 错误密码与不存在的账号：同码、同文案、耗时相当 ============
 
 func TestAuth_1_WrongPasswordAndUnknownUserLookAlike(t *testing.T) {
-	f := newAuthFixture(t, WithBcryptCost(10))
-	f.cost = 10
+	f := newAuthFixture(t, WithPasswordHashParams(19456, 2)) // 生产用的参数：一次比较要花得出来的时间
 	f.addUser("alice", "correct-horse-9")
 
 	bad := f.login("alice", "wrong-password-9")
@@ -310,10 +327,10 @@ func TestAuth_1_WrongPasswordAndUnknownUserLookAlike(t *testing.T) {
 	require.Equal(t, httpx.CodeLoginFailed, unknown.env.Code)
 	require.Equal(t, bad.env.Msg, unknown.env.Msg)
 
-	// 账号不存在时也必须做一次 bcrypt 比较：耗时不能明显短于一次真实比较
-	h, _ := bcrypt.GenerateFromPassword([]byte("x"), 10)
+	// 账号不存在时也必须做一次哈希比较：耗时不能明显短于一次真实比较
+	h := f.hashOf("x")
 	start := time.Now()
-	_ = bcrypt.CompareHashAndPassword(h, []byte("y"))
+	f.app.hasher.Verify(h, "y")
 	oneCompare := time.Since(start)
 	start = time.Now()
 	f.login("nobody2", "wrong-password-9")
@@ -652,7 +669,7 @@ func TestAuth_RefreshRejectsSessionFromAnotherPortal(t *testing.T) {
 	mgr := f.app.authenticators[testPortal].Sessions()
 
 	// 直接在另一个端名下造一个同用户 ID 的会话，拿它的刷新凭证去 platform 端刷新
-	other, tok, err := mgr.Create(ctx, "other", uid, "203.0.113.9", "ua")
+	other, tok, err := mgr.Create(ctx, "other", 0, uid, "203.0.113.9", "ua")
 	require.NoError(t, err)
 	r := f.refresh(tok.String())
 	require.Equal(t, 401, r.rec.Code, "别的端的刷新凭证不能换出本端的令牌")
@@ -678,7 +695,7 @@ func TestAuth_RevokeSessionIsScopedToPortal(t *testing.T) {
 	svc := f.app.Deps().Auth
 
 	// 别的端的会话：拿着它的 sid 在 platform 端吊销，得到 404，会话不受影响
-	other, tok, err := mgr.Create(ctx, "other", uid, "203.0.113.9", "ua")
+	other, tok, err := mgr.Create(ctx, "other", 0, uid, "203.0.113.9", "ua")
 	require.NoError(t, err)
 	err = svc.RevokeSession(ctx, testPortal, other.SID, auth.RevokeAdmin)
 	require.ErrorIs(t, err, httpx.ErrNotFound, "别的端的会话对本端来说不存在")
@@ -1120,10 +1137,24 @@ func TestAuth_110_CheapRejectionsAndPasswordGate(t *testing.T) {
 		require.Equal(t, httpx.CodeLoginFailed, f.do("POST", "/auth/login", gin.H{"username": "alice", "password": "wrong-9"}, from(i)).env.Code, i)
 	}
 	require.EqualValues(t, 10, count())
+	// 账号的次数用完之后不拒绝，改为要验证码（D-103）：没带验证码的和别的验证码失败一样记一行登录日志，不记限流事件
 	for i := 10; i < 15; i++ {
-		require.Equal(t, 429, f.do("POST", "/auth/login", gin.H{"username": "alice", "password": "wrong-9"}, from(i)).rec.Code)
+		r := f.do("POST", "/auth/login", gin.H{"username": "alice", "password": "wrong-9"}, from(i))
+		require.NotEqual(t, 429, r.rec.Code, i)
+		require.Equal(t, httpx.CodeCaptchaRequired, r.env.Code, i)
 	}
-	require.EqualValues(t, 10, count(), "被限流的请求不写登录日志")
+	require.EqualValues(t, 15, count())
+	require.NotContains(t, f.securityEvents(), "login_rate_limited")
+	// 来源的次数（每分钟 20 次）用完才是限流：回 429、不写登录日志，只记合并的安全事件
+	src := func(r *http.Request) { r.RemoteAddr = "203.0.113.9:5000" }
+	for i := 0; i < 20; i++ {
+		require.Equal(t, httpx.CodeLoginFailed, f.do("POST", "/auth/login", gin.H{"username": fmt.Sprintf("ghost%d", i), "password": "wrong-9"}, src).env.Code, i)
+	}
+	require.EqualValues(t, 35, count())
+	for i := 20; i < 25; i++ {
+		require.Equal(t, 429, f.do("POST", "/auth/login", gin.H{"username": fmt.Sprintf("ghost%d", i), "password": "wrong-9"}, src).rec.Code)
+	}
+	require.EqualValues(t, 35, count(), "被限流的请求不写登录日志")
 	require.Contains(t, f.securityEvents(), "login_rate_limited") // 先把攒着的写进去
 	var limited int64
 	require.NoError(t, f.app.Deps().DB.Raw("SELECT COALESCE(SUM(count), 0) FROM ga_security_event WHERE kind = 'login_rate_limited'").Scan(&limited).Error)
@@ -1139,14 +1170,14 @@ func TestAuth_110_CheapRejectionsAndPasswordGate(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		require.Equal(t, httpx.CodeLoginFailed, withCaptcha("carol").env.Code, i)
 	}
-	require.EqualValues(t, 20, count())
+	require.EqualValues(t, 45, count())
 	r := withCaptcha("carol")
 	require.Equal(t, httpx.CodeLocked, r.env.Code, r.rec.Body.String())
-	require.EqualValues(t, 20, count(), "被锁定的请求不写登录日志")
+	require.EqualValues(t, 45, count(), "被锁定的请求不写登录日志")
 	require.Contains(t, f.securityEvents(), "login_locked")
 
 	// 核对密码的并发上限：占满之后的登录回 429，不记失败
-	g := newAuthFixture(t, func(a *App) { a.pwdParallel = 1 })
+	g := newAuthFixture(t, func(a *App) { a.pwdParallel = 1; a.pwdWait = 50 * time.Millisecond })
 	g.addUser("bob", "correct-horse-9")
 	access, _ := g.mustLogin("bob", "correct-horse-9")
 	require.Equal(t, 200, g.ping(access).rec.Code) // 账号状态进缓存，下面的改密请求第一次查账号是在核对密码之前
@@ -1164,7 +1195,7 @@ func TestAuth_110_CheapRejectionsAndPasswordGate(t *testing.T) {
 		require.Equal(t, 429, busy.rec.Code, busy.rec.Body.String())
 	case <-time.After(3 * time.Second):
 		close(release)
-		t.Fatal("位置占满时登录没有立即回 429")
+		t.Fatal("位置占满时登录没有在等待时限之后回 429")
 	}
 	close(release)
 	<-done

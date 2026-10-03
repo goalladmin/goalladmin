@@ -6,9 +6,18 @@
 #   open http://localhost:8000
 #
 # 后端的 8080 只给容器网络用；浏览器一律经 nginx 访问，这样刷新 Cookie 与页面同源（规范 §5.2）。
+# 标准输出轮转；长期审计保留请另接日志采集（D-092）。
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   mysql:
-    image: mysql:8.0
+    logging: *logging
+    # 旧 8.0 数据卷先通过 GA_MYSQL_IMAGE 固定原版本，按运维指南单独升级引擎（D-107）。
+    image: ${GA_MYSQL_IMAGE:-mysql:8.4}
     environment:
       MYSQL_ROOT_PASSWORD: ${GA_DB_ROOT_PASSWORD:?set GA_DB_ROOT_PASSWORD in deploy/.env}
       MYSQL_DATABASE: goalladmin
@@ -19,13 +28,14 @@ services:
     volumes:
       - mysql-data:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${GA_DB_ROOT_PASSWORD}"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--silent"]
       interval: 5s
       timeout: 5s
       retries: 30
     # 数据库端口不对外映射（规范 §12）。需要本机连库时临时加 ports。
 
   server:
+    logging: *logging
     build:
       context: ..
       dockerfile: deploy/Dockerfile.server
@@ -39,6 +49,10 @@ services:
       GA_SERVER_ALLOWED_ORIGINS: ${GA_SERVER_ALLOWED_ORIGINS:-http://localhost:8000}
       # 只信任 nginx 容器（下面给它固定了 IP）。信任整段私网会让内网客户端伪造 X-Forwarded-For 绕过按 IP 的登录限流。
       GA_SERVER_TRUSTED_PROXIES: ${GA_SERVER_TRUSTED_PROXIES:-172.30.0.10}
+      # 密码哈希算法、同时做密码计算的上限：不在 deploy/.env 里写就是默认值（Argon2id、按 CPU 数）。
+      # 什么时候要改、怎么改见 docs/guides/password-hash.md
+      GA_SERVER_PASSWORD_HASH: ${GA_SERVER_PASSWORD_HASH:-argon2id}
+      GA_SERVER_PASSWORD_PARALLEL: ${GA_SERVER_PASSWORD_PARALLEL:-0}
       GA_DB_HOST: mysql
       GA_DB_PORT: "3306"
       GA_DB_NAME: goalladmin
@@ -57,6 +71,7 @@ services:
       retries: 10
 
   web:
+    logging: *logging
     build:
       context: ..
       dockerfile: deploy/Dockerfile.web

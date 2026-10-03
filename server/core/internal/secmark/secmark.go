@@ -23,12 +23,14 @@ const (
 	UnlockExhausted    = "unlock_exhausted"     // 锁屏解锁次数用完，会话被吊销
 	PwdChangeThrottled = "pwd_change_throttled" //nolint:gosec // 事件类型名，不是凭据。改密时核对旧密码次数用完：拿着令牌在试密码（D-055）
 	CLI                = "cli"                  // 命令行操作（创建管理员、清理策略）
+	IPDenied           = "ip_denied"            // IP 黑名单、白名单拒绝的请求（D-062）；Detail 是哪一层：deny / portal / account
 )
 
 // Mark 是一个安全事件的标记。身份字段为空时由审计中间件从请求的当前身份补上。
 type Mark struct {
 	Kind      string
 	Detail    string
+	OrgID     uint64 // 主体端：相关账号所属的主体（D-061）
 	UserID    uint64
 	Username  string
 	SessionID string

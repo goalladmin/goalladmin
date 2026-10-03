@@ -74,6 +74,19 @@ func requireImageBody(c *gin.Context) {
 	c.Next()
 }
 
+// admitAvatar 排在操作记录预读之前，满位时不读取图片请求体。
+func (h *handlers) admitAvatar(c *gin.Context) {
+	ctx, release, err := h.users.admitAvatar(c.Request.Context(), auth.MustFromCtx(c.Request.Context()).UserID)
+	if err != nil {
+		httpx.Fail(c, err)
+		c.Abort()
+		return
+	}
+	defer release()
+	c.Request = c.Request.WithContext(ctx)
+	c.Next()
+}
+
 // uploadAvatar 处理 POST /system/avatar：请求体就是图片本身（JPEG 或 PNG）。
 func (h *handlers) uploadAvatar(c *gin.Context) {
 	raw, err := io.ReadAll(c.Request.Body)
